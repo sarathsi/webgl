@@ -1,0 +1,58 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Minimal XHR + TypedArray Repro</title>
+</head>
+<body>
+  <pre id="log"></pre>
+
+  <script>
+    function log(msg) {
+      document.getElementById('log').textContent += msg + "\n";
+      console.log(msg);
+    }
+
+    function run() {
+      const xhr = new XMLHttpRequest();
+      xhr.open("GET", "data.bin", true);
+      xhr.responseType = "arraybuffer";
+
+      xhr.onload = function () {
+        if (xhr.status !== 200) {
+          log("XHR failed: status=" + xhr.status);
+          return;
+        }
+
+        const buffer = xhr.response;
+        log("ArrayBuffer byteLength = " + buffer.byteLength);
+
+        // Interpret data similarly to the original test patterns
+        const u8  = new Uint8Array(buffer);
+        const u16 = new Uint16Array(buffer);
+        const f32 = new Float32Array(buffer);
+
+        log("Uint8[0..7]  = " + Array.from(u8.slice(0, 8)).join(", "));
+        log("Uint16[0..3] = " + Array.from(u16.slice(0, 4)).join(", "));
+        log("Float32[0..3] = " + Array.from(f32.slice(0, 4)).join(", "));
+
+        // Simple computation to catch misreads / endian / alignment issues
+        let sum = 0;
+        for (let i = 0; i < u8.length; i++) {
+          sum += u8[i];
+        }
+        log("Uint8 sum = " + sum);
+      };
+
+      xhr.onerror = function () {
+        log("XHR network error");
+      };
+
+      xhr.send();
+    }
+
+    run();
+  </script>
+</body>
+</html>
+
