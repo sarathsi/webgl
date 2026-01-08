@@ -15,10 +15,14 @@
 
 <script>
 const gl = c.getContext("webgl");
+
 if (!gl) {
-      alert("WebGL not supported");
-      return;
-    }
+  alert("WebGL not supported");
+  console.error("WebGL not supported");
+} else {
+  alert("WebGL supported");
+  console.error("WebGL supported");
+}
 
 const vs = gl.createShader(gl.VERTEX_SHADER);
 gl.shaderSource(vs, `
