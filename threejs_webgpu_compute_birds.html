@@ -22,6 +22,37 @@
 			Move mouse to disturb birds.
 		</div>
 
+		<!-- ADDED: adapter-backend readout. Shows the WebGPU adapter so you can tell
+		     whether WebGPU is on Vulkan or the GLES/ANGLE compat path. Note: the
+		     standard GPUAdapterInfo has no guaranteed "backend" field, so this prints
+		     vendor/architecture/device/description (the GPU/driver name often reveals
+		     it — a Vulkan device name vs an "ANGLE …/GLES" string). The AUTHORITATIVE
+		     check is the GPU-process hilog line:  [WEBGPU] SARATH selected adapter
+		     backend=2 (Vulkan) / =5 (OpenGLES)  from webgpu_decoder_impl.cc. -->
+		<div id="gpuinfo" style="position:fixed;left:8px;bottom:8px;z-index:1000;
+			font:12px/1.4 monospace;color:#9fe;background:rgba(0,0,0,.6);padding:6px 8px;
+			border-radius:6px;white-space:pre;pointer-events:none;">adapter: querying…</div>
+		<script>
+		(async () => {
+			const el = document.getElementById('gpuinfo');
+			try {
+				if (!navigator.gpu) { el.textContent = 'navigator.gpu undefined (WebGPU off)'; return; }
+				const a = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
+				if (!a) { el.textContent = 'requestAdapter() → null (WebGPU disabled)'; return; }
+				let i = a.info;
+				if (!i && a.requestAdapterInfo) i = await a.requestAdapterInfo();
+				i = i || {};
+				el.textContent = 'WebGPU adapter:\n'
+					+ '  vendor: ' + (i.vendor || '?') + '\n'
+					+ '  arch:   ' + (i.architecture || '?') + '\n'
+					+ '  device: ' + (i.device || '?') + '\n'
+					+ '  desc:   ' + (i.description || '?') + '\n'
+					+ (i.backend ? ('  backend:' + i.backend + '\n') : '')
+					+ '(authoritative: hilog "SARATH selected adapter backend=2 Vulkan / 5 GLES")';
+			} catch (e) { el.textContent = 'adapter query failed: ' + e.message; }
+		})();
+		</script>
+
 		<!-- MODIFIED: imports re-pointed to a pinned CDN so this runs standalone
 		     (serve via `python3 -m http.server` + `hdc rport`; needs internet).
 		     BIRDS is URL-tunable (?birds=N or ?count=N); default 16384 = 128², so it

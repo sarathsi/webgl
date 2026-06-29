@@ -1,0 +1,404 @@
+<!DOCTYPE html>
+<!--
+  WebGPU vs WebGL2 — TILED N-BODY (O(N²) gravity) A/B.  FAIR GPU-vs-GPU.
+  Self-contained, no network deps. Works offline on the OHOS device.
+
+  Same simulation on both: N point masses, 2D gravity, every body pulled by every
+  other (O(N²)), softened, speed-clamped, toroidal wrap. Rendered identically as
+  1px points coloured by speed.
+
+  The difference is HOW the O(N²) gather is done — and this is the case where
+  WebGPU's compute model structurally beats WebGL:
+    * WebGPU : a COMPUTE shader with WORKGROUP SHARED MEMORY tiling. Each workgroup
+               loads a tile of positions into fast on-chip shared memory once, all
+               64 threads reuse it, then advances to the next tile. This slashes
+               global-memory traffic — the classic GPU N-body optimization.
+    * WebGL2 : has no compute and no shared memory, so it uses float-texture GPGPU:
+               a fragment pass where each body loops over ALL others via texelFetch
+               on a position texture (texture cache, but no shared-memory reuse).
+
+  Both are O(N²) on the GPU; WebGPU wins because shared-memory tiling beats repeated
+  texture/global reads. (Contrast: the stock three.js boids does a NAIVE storage
+  loop with no tiling, which is why it LOSES to WebGL there.)
+
+  IMPORTANT (OHOS):
+    * Vulkan ON  (Dawn→Vulkan): genuine native win, shared memory is real on-chip.
+    * Vulkan OFF (compat, Dawn→GLES→ANGLE): needs GLES 3.1 compute; if unavailable
+      WebGPU init fails and the HUD says so.
+    * WebGL2 needs EXT_color_buffer_float (float render targets) — checked, errors if absent.
+
+  URL params:
+    ?api=webgpu | webgl | auto   (default auto = WebGPU if available else WebGL2)
+    ?count=N                     (bodies; rounded to a square, default 16384 = 128²)
+    ?seconds=S                   (measure S s after warmup then print summary; 0=forever)
+    ?warmup=F                    (frames skipped before measuring, default 60)
+  Keyboard: 'r' restarts the measurement window.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>WebGPU vs WebGL — tiled N-body</title>
+<style>
+  html,body{margin:0;height:100%;overflow:hidden;background:#03040a;}
+  canvas{display:block;width:100vw;height:100vh;}
+  #hud{position:fixed;top:8px;left:8px;padding:8px 10px;font:12px/1.4 monospace;
+       color:#e8e8ec;background:rgba(0,0,0,.55);border-radius:6px;white-space:pre;
+       pointer-events:none;z-index:10;}
+  #summary{position:fixed;top:8px;right:8px;padding:8px 10px;font:12px/1.4 monospace;
+       color:#aef0c0;background:rgba(0,0,0,.6);border-radius:6px;white-space:pre;
+       z-index:10;max-width:48vw;}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hud">starting…</div>
+<div id="summary"></div>
+<script>
+"use strict";
+
+// ---------------------------------------------------------------- params
+const Q = new URLSearchParams(location.search);
+const API = (Q.get("api") || "auto").toLowerCase();
+const COUNT = Math.max(64, parseInt(Q.get("count") || "16384", 10));
+const SECONDS = parseFloat(Q.get("seconds") || "0");
+const WARMUP = parseInt(Q.get("warmup") || "60", 10);
+
+const SIDE = Math.round(Math.sqrt(COUNT));   // square grid for the WebGL texture
+const N = SIDE * SIDE;
+const TILE = 64;                              // workgroup size = shared-mem tile
+
+const hud = document.getElementById("hud");
+const summary = document.getElementById("summary");
+const canvas = document.getElementById("c");
+
+// ---------------------------------------------------------------- shared physics constants
+const G = 3e-8, SOFT = 0.0008, DT = 1.0, VMAX = 0.012, KCOL = 70.0;
+// format a JS number as a valid GLSL/WGSL float literal (needs '.' or exponent)
+const f = (x) => (Number.isInteger(x) ? x.toFixed(1) : String(x));
+
+// ---------------------------------------------------------------- initial bodies (disk + spin)
+const posXY = new Float32Array(N * 2);
+const velXY = new Float32Array(N * 2);
+for (let i = 0; i < N; i++) {
+  const r = Math.sqrt(Math.random()) * 0.7;
+  const a = Math.random() * Math.PI * 2;
+  const x = Math.cos(a) * r, y = Math.sin(a) * r;
+  posXY[i*2] = x; posXY[i*2+1] = y;
+  velXY[i*2] = -Math.sin(a) * 0.004 * r;   // tangential → swirl
+  velXY[i*2+1] = Math.cos(a) * 0.004 * r;
+}
+
+// ---------------------------------------------------------------- WebGL2 backend (float-texture GPGPU)
+function initWebGL(){
+  const gl = canvas.getContext("webgl2", {antialias:false, powerPreference:"high-performance"});
+  if (!gl) throw new Error("WebGL2 unavailable");
+  if (!gl.getExtension("EXT_color_buffer_float"))
+    throw new Error("EXT_color_buffer_float unsupported (no float render targets)");
+
+  const sh=(t,s)=>{const o=gl.createShader(t);gl.shaderSource(o,s);gl.compileShader(o);
+    if(!gl.getShaderParameter(o,gl.COMPILE_STATUS))throw new Error(gl.getShaderInfoLog(o));return o;};
+  const prog=(vs,fs)=>{const p=gl.createProgram();gl.attachShader(p,sh(gl.VERTEX_SHADER,vs));
+    gl.attachShader(p,sh(gl.FRAGMENT_SHADER,fs));gl.linkProgram(p);
+    if(!gl.getProgramParameter(p,gl.LINK_STATUS))throw new Error(gl.getProgramInfoLog(p));return p;};
+
+  const QUAD_VS=`#version 300 es
+    in vec2 aPos; void main(){ gl_Position=vec4(aPos,0.0,1.0); }`;
+  const C = `const int SIDE=${SIDE};\nconst float G=${f(G)};\nconst float SOFT=${f(SOFT)};\n`+
+            `const float DT=${f(DT)};\nconst float VMAX=${f(VMAX)};\nconst float KCOL=${f(KCOL)};\n`;
+  const VEL_FS=`#version 300 es
+    precision highp float;
+    ${C}
+    uniform sampler2D uPos; uniform sampler2D uVel;
+    out vec4 o;
+    void main(){
+      ivec2 tc=ivec2(gl_FragCoord.xy);
+      vec2 self=texelFetch(uPos,tc,0).xy;
+      vec2 v=texelFetch(uVel,tc,0).xy;
+      vec2 acc=vec2(0.0);
+      for(int jy=0;jy<SIDE;jy++){
+        for(int jx=0;jx<SIDE;jx++){
+          vec2 d=texelFetch(uPos,ivec2(jx,jy),0).xy - self;
+          float r2=dot(d,d)+SOFT;
+          float inv=inversesqrt(r2);
+          acc+=d*(G*inv*inv*inv);
+        }
+      }
+      v+=acc*DT;
+      float sp=length(v); if(sp>VMAX) v*=VMAX/sp;
+      o=vec4(v,0.0,0.0);
+    }`;
+  const POS_FS=`#version 300 es
+    precision highp float;
+    ${C}
+    uniform sampler2D uPos; uniform sampler2D uVel;
+    out vec4 o;
+    void main(){
+      ivec2 tc=ivec2(gl_FragCoord.xy);
+      vec2 p=texelFetch(uPos,tc,0).xy + texelFetch(uVel,tc,0).xy*DT;
+      p=fract((p+1.0)*0.5)*2.0-1.0;       // toroidal wrap to [-1,1]
+      o=vec4(p,0.0,0.0);
+    }`;
+  const RENDER_VS=`#version 300 es
+    precision highp float;
+    ${C}
+    uniform sampler2D uPos; uniform sampler2D uVel;
+    out vec3 vColor;
+    void main(){
+      int id=gl_VertexID; ivec2 tc=ivec2(id%SIDE, id/SIDE);
+      vec2 p=texelFetch(uPos,tc,0).xy;
+      vec2 v=texelFetch(uVel,tc,0).xy;
+      gl_Position=vec4(p,0.0,1.0); gl_PointSize=1.0;
+      float sp=clamp(length(v)*KCOL,0.0,1.0);
+      vColor=mix(vec3(0.10,0.30,0.95), vec3(1.0,0.9,0.30), sp);
+    }`;
+  const RENDER_FS=`#version 300 es
+    precision mediump float; in vec3 vColor; out vec4 o; void main(){ o=vec4(vColor,1.0); }`;
+
+  const velProg=prog(QUAD_VS,VEL_FS), posProg=prog(QUAD_VS,POS_FS), rndProg=prog(RENDER_VS,RENDER_FS);
+  for(const p of [velProg,posProg,rndProg]){ gl.useProgram(p);
+    gl.uniform1i(gl.getUniformLocation(p,"uPos"),0); gl.uniform1i(gl.getUniformLocation(p,"uVel"),1); }
+
+  // float textures + FBOs (ping-pong)
+  function tex(rgba){ const t=gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D,t);
+    gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA32F,SIDE,SIDE,0,gl.RGBA,gl.FLOAT,rgba);
+    gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE); return t; }
+  const posRGBA=new Float32Array(N*4), velRGBA=new Float32Array(N*4);
+  for(let i=0;i<N;i++){ posRGBA[i*4]=posXY[i*2]; posRGBA[i*4+1]=posXY[i*2+1];
+                        velRGBA[i*4]=velXY[i*2]; velRGBA[i*4+1]=velXY[i*2+1]; }
+  const posT=[tex(posRGBA),tex(null)], velT=[tex(velRGBA),tex(null)];
+  function fbo(t){ const f=gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER,f);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,gl.TEXTURE_2D,t,0);
+    if(gl.checkFramebufferStatus(gl.FRAMEBUFFER)!==gl.FRAMEBUFFER_COMPLETE) throw new Error("float FBO incomplete");
+    return f; }
+  const posF=[fbo(posT[0]),fbo(posT[1])], velF=[fbo(velT[0]),fbo(velT[1])];
+
+  // fullscreen quad
+  const quad=gl.createVertexArray(); gl.bindVertexArray(quad);
+  const qb=gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER,qb);
+  gl.bufferData(gl.ARRAY_BUFFER,new Float32Array([-1,-1, 1,-1, -1,1, 1,1]),gl.STATIC_DRAW);
+  for(const p of [velProg,posProg]){ const l=gl.getAttribLocation(p,"aPos");
+    gl.vertexAttribPointer(l,2,gl.FLOAT,false,0,0); gl.enableVertexAttribArray(l); }
+  const pointVAO=gl.createVertexArray();   // empty VAO; positions come from texture in the shader
+
+  let cp=0, cv=0;
+  gl.clearColor(0.01,0.012,0.03,1);
+  function bindTex(pIdx,vIdx){ gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D,posT[pIdx]);
+    gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D,velT[vIdx]); }
+
+  return {
+    name:"WebGL2 (texture GPGPU)",
+    info: gl.getParameter(gl.RENDERER),
+    resize(){},
+    frame(){
+      gl.disable(gl.BLEND); gl.disable(gl.DEPTH_TEST);
+      gl.bindVertexArray(quad);
+      // velocity pass: read posT[cp],velT[cv] -> write velT[1-cv]
+      gl.bindFramebuffer(gl.FRAMEBUFFER,velF[1-cv]); gl.viewport(0,0,SIDE,SIDE);
+      gl.useProgram(velProg); bindTex(cp,cv); gl.drawArrays(gl.TRIANGLE_STRIP,0,4);
+      // position pass: read posT[cp],velT[1-cv] -> write posT[1-cp]
+      gl.bindFramebuffer(gl.FRAMEBUFFER,posF[1-cp]); gl.viewport(0,0,SIDE,SIDE);
+      gl.useProgram(posProg); bindTex(cp,1-cv); gl.drawArrays(gl.TRIANGLE_STRIP,0,4);
+      cv=1-cv; cp=1-cp;
+      // render
+      gl.bindFramebuffer(gl.FRAMEBUFFER,null); gl.viewport(0,0,canvas.width,canvas.height);
+      gl.clear(gl.COLOR_BUFFER_BIT);
+      gl.useProgram(rndProg); gl.bindVertexArray(pointVAO); bindTex(cp,cv);
+      gl.drawArrays(gl.POINTS,0,N);
+    }
+  };
+}
+
+// ---------------------------------------------------------------- WebGPU backend (tiled compute)
+async function initWebGPU(){
+  if(!navigator.gpu) throw new Error("navigator.gpu undefined (WebGPU disabled)");
+  const adapter=await navigator.gpu.requestAdapter({powerPreference:"high-performance"});
+  if(!adapter) throw new Error("requestAdapter() returned null");
+  const device=await adapter.requestDevice();
+  if(device.addEventListener) device.addEventListener("uncapturederror",
+    e=>console.error("WebGPU error:", (e.error&&e.error.message)||e));
+  const ctx=canvas.getContext("webgpu");
+  const format=navigator.gpu.getPreferredCanvasFormat();
+  ctx.configure({device,format,alphaMode:"opaque"});
+
+  let info="WebGPU (tiled compute)";
+  try{const ai=adapter.info||(adapter.requestAdapterInfo&&await adapter.requestAdapterInfo());
+      if(ai) info=`WebGPU tiled | ${ai.vendor||""} ${ai.architecture||""} ${ai.device||""} ${ai.description||""}`.trim();}catch(e){}
+
+  const pos=device.createBuffer({size:N*8, usage:GPUBufferUsage.STORAGE|GPUBufferUsage.VERTEX|GPUBufferUsage.COPY_DST});
+  const vel=device.createBuffer({size:N*8, usage:GPUBufferUsage.STORAGE|GPUBufferUsage.VERTEX|GPUBufferUsage.COPY_DST});
+  device.queue.writeBuffer(pos,0,posXY);
+  device.queue.writeBuffer(vel,0,velXY);
+  const uBuf=device.createBuffer({size:16, usage:GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST});
+  // U: n(u32), g(f32), soft(f32), vmax(f32)   (dt baked as const)
+  const uAB=new ArrayBuffer(16), uF=new Float32Array(uAB), uU=new Uint32Array(uAB);
+  uU[0]=N; uF[1]=G; uF[2]=SOFT; uF[3]=VMAX;
+  device.queue.writeBuffer(uBuf,0,uAB);
+
+  const computeMod=device.createShaderModule({code:`
+    struct U { n:u32, g:f32, soft:f32, vmax:f32 };
+    @group(0) @binding(0) var<storage, read_write> pos: array<vec2<f32>>;
+    @group(0) @binding(1) var<storage, read_write> vel: array<vec2<f32>>;
+    @group(0) @binding(2) var<uniform> u: U;
+    const DT: f32 = ${f(DT)};
+    var<workgroup> shPos: array<vec2<f32>, ${TILE}>;
+    @compute @workgroup_size(${TILE})
+    fn velStep(@builtin(global_invocation_id) gid: vec3<u32>,
+               @builtin(local_invocation_index) lidx: u32){
+      let i = gid.x;
+      let self = pos[min(i, u.n - 1u)];
+      var acc = vec2<f32>(0.0, 0.0);
+      let tiles = (u.n + ${TILE}u - 1u) / ${TILE}u;
+      for (var t: u32 = 0u; t < tiles; t = t + 1u){
+        let j = t*${TILE}u + lidx;
+        var pj = pos[min(j, u.n - 1u)];
+        if (j >= u.n){ pj = vec2<f32>(1e9, 1e9); }   // padding → negligible force
+        shPos[lidx] = pj;
+        workgroupBarrier();
+        for (var k: u32 = 0u; k < ${TILE}u; k = k + 1u){
+          let d = shPos[k] - self;
+          let r2 = dot(d, d) + u.soft;
+          let inv = inverseSqrt(r2);
+          acc = acc + d * (u.g * inv*inv*inv);
+        }
+        workgroupBarrier();
+      }
+      if (i < u.n){
+        var v = vel[i] + acc*DT;
+        let sp = length(v);
+        if (sp > u.vmax){ v = v * (u.vmax/sp); }
+        vel[i] = v;
+      }
+    }
+    @compute @workgroup_size(${TILE})
+    fn posStep(@builtin(global_invocation_id) gid: vec3<u32>){
+      let i = gid.x;
+      if (i >= u.n){ return; }
+      var p = pos[i] + vel[i]*DT;
+      p = fract((p + 1.0)*0.5)*2.0 - 1.0;          // toroidal wrap
+      pos[i] = p;
+    }`});
+  const renderMod=device.createShaderModule({code:`
+    const KCOL: f32 = ${f(KCOL)};
+    struct VSOut { @builtin(position) pos: vec4<f32>, @location(0) color: vec3<f32> };
+    @vertex fn vs(@location(0) p: vec2<f32>, @location(1) v: vec2<f32>) -> VSOut {
+      var o: VSOut; o.pos = vec4<f32>(p, 0.0, 1.0);
+      let sp = clamp(length(v)*KCOL, 0.0, 1.0);
+      o.color = mix(vec3<f32>(0.10,0.30,0.95), vec3<f32>(1.0,0.9,0.30), sp);
+      return o;
+    }
+    @fragment fn fs(in: VSOut) -> @location(0) vec4<f32> { return vec4<f32>(in.color,1.0); }`});
+
+  const bgl=device.createBindGroupLayout({entries:[
+    {binding:0,visibility:GPUShaderStage.COMPUTE,buffer:{type:"storage"}},
+    {binding:1,visibility:GPUShaderStage.COMPUTE,buffer:{type:"storage"}},
+    {binding:2,visibility:GPUShaderStage.COMPUTE,buffer:{type:"uniform"}}]});
+  const pl=device.createPipelineLayout({bindGroupLayouts:[bgl]});
+  const velPipe=device.createComputePipeline({layout:pl, compute:{module:computeMod,entryPoint:"velStep"}});
+  const posPipe=device.createComputePipeline({layout:pl, compute:{module:computeMod,entryPoint:"posStep"}});
+  const bind=device.createBindGroup({layout:bgl, entries:[
+    {binding:0,resource:{buffer:pos}},{binding:1,resource:{buffer:vel}},{binding:2,resource:{buffer:uBuf}}]});
+  const renderPipe=device.createRenderPipeline({layout:"auto",
+    vertex:{module:renderMod,entryPoint:"vs",buffers:[
+      {arrayStride:8,attributes:[{shaderLocation:0,offset:0,format:"float32x2"}]},
+      {arrayStride:8,attributes:[{shaderLocation:1,offset:0,format:"float32x2"}]}]},
+    fragment:{module:renderMod,entryPoint:"fs",targets:[{format}]},
+    primitive:{topology:"point-list"}});
+
+  const groups=Math.ceil(N/TILE);
+  return {
+    name:"WebGPU (tiled compute)", info,
+    resize(){},
+    frame(){
+      const enc=device.createCommandEncoder();
+      let cp=enc.beginComputePass(); cp.setPipeline(velPipe); cp.setBindGroup(0,bind);
+        cp.dispatchWorkgroups(groups); cp.end();
+      cp=enc.beginComputePass(); cp.setPipeline(posPipe); cp.setBindGroup(0,bind);
+        cp.dispatchWorkgroups(groups); cp.end();
+      const rp=enc.beginRenderPass({colorAttachments:[{view:ctx.getCurrentTexture().createView(),
+        clearValue:{r:0.01,g:0.012,b:0.03,a:1},loadOp:"clear",storeOp:"store"}]});
+      rp.setPipeline(renderPipe); rp.setVertexBuffer(0,pos); rp.setVertexBuffer(1,vel);
+      rp.draw(N); rp.end();
+      device.queue.submit([enc.finish()]);
+    }
+  };
+}
+
+// ---------------------------------------------------------------- stats (same harness)
+let samples=[],frameNo=0,collecting=false,collectStart=0,done=false,rolling=[];
+function resetStats(){samples=[];frameNo=0;collecting=false;done=false;rolling=[];summary.textContent="";}
+function finalize(){
+  done=true;collecting=false;
+  if(!samples.length){summary.textContent="no samples";return;}
+  const s=[...samples].sort((a,b)=>a-b);
+  const mean=s.reduce((a,b)=>a+b,0)/s.length;
+  const p=q=>s[Math.min(s.length-1,Math.floor(s.length*q))];
+  const r={frames:s.length,meanFps:+(1000/mean).toFixed(1),
+    p50ms:+p(.5).toFixed(2),p95ms:+p(.95).toFixed(2),p99ms:+p(.99).toFixed(2),
+    minms:+s[0].toFixed(2),maxms:+s[s.length-1].toFixed(2),slow_gt33ms:s.filter(x=>x>33.3).length};
+  summary.textContent=
+    `=== RESULT (${backend.name}) ===\n`+
+    `bodies    : ${N} (O(N²) = ${(N*N/1e6).toFixed(0)}M pairs/frame)\n`+
+    `frames    : ${r.frames}\n`+
+    `mean FPS  : ${r.meanFps}\n`+
+    `p50/p95/p99 ms : ${r.p50ms} / ${r.p95ms} / ${r.p99ms}\n`+
+    `min/max ms     : ${r.minms} / ${r.maxms}\n`+
+    `slow >33ms     : ${r.slow_gt33ms}`;
+  console.log("[nbody A/B]",{api:backend.name,bodies:N,...r});
+  console.table([{api:backend.name,bodies:N,...r}]);
+}
+
+// ---------------------------------------------------------------- main loop
+let backend=null,prev=0;
+function resize(){
+  const dpr=Math.min(window.devicePixelRatio||1,2);
+  canvas.width=Math.floor(innerWidth*dpr);
+  canvas.height=Math.floor(innerHeight*dpr);
+  if(backend) backend.resize();
+}
+addEventListener("resize",resize);
+addEventListener("keydown",e=>{if(e.key==="r")resetStats();});
+
+function loop(now){
+  if(!prev) prev=now;
+  backend.frame();
+  const dt=now-prev; prev=now; frameNo++;
+  rolling.push(dt); if(rolling.length>30)rolling.shift();
+  const rfps=1000/(rolling.reduce((a,b)=>a+b,0)/rolling.length);
+  if(!done&&frameNo>WARMUP){
+    if(!collecting){collecting=true;collectStart=now;}
+    samples.push(dt);
+    if(SECONDS>0&&(now-collectStart)/1000>=SECONDS) finalize();
+  }
+  hud.textContent=
+    `${backend.name}\n`+
+    `${N.toLocaleString()} bodies  (O(N²) = ${(N*N/1e6).toFixed(0)}M pairs/frame)\n`+
+    `FPS ${rfps.toFixed(1)}   frame ${dt.toFixed(2)} ms\n`+
+    `${backend.info}\n`+
+    (SECONDS>0
+      ? (done?`measure: DONE (press 'r' to rerun)`
+             :(collecting?`measure: ${((now-collectStart)/1000).toFixed(1)}/${SECONDS}s`:`warmup…`))
+      : `measure: rolling (add ?seconds=10 for a summary)`);
+  requestAnimationFrame(loop);
+}
+
+(async function start(){
+  resize();
+  try{
+    if(API==="webgl")      backend=initWebGL();
+    else if(API==="webgpu")backend=await initWebGPU();
+    else{ try{backend=await initWebGPU();}catch(e){console.warn("WebGPU unavailable → WebGL2:",e.message);backend=initWebGL();} }
+  }catch(e){
+    hud.textContent="INIT FAILED: "+e.message;
+    summary.textContent="If you forced ?api=webgpu and WebGPU is off, or GLES compute /\nEXT_color_buffer_float is unavailable, this is expected — see the header.";
+    return;
+  }
+  resize();
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
