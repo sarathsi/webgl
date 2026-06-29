@@ -300,10 +300,9 @@
 		<!-- MODIFIED for apples-to-apples vs webgpu_compute_birds:
 		     - imports re-pointed to a pinned CDN so this runs standalone
 		       (serve via `python3 -m http.server` + `hdc rport`); needs internet.
-		     - WIDTH is URL-tunable (?width=N). Default 90 -> 90*90 = 8100 birds,
-		       matching webgpu_compute_birds' BIRDS=8192 (~1.1% off; texture must be
-		       square so 8192 exactly isn't possible — use ?width=91 for 8281 to
-		       bracket it). BOUNDS=800 already matches the WebGPU example.
+		     - WIDTH is URL-tunable (?width=N). Default 128 -> 128*128 = 16384 birds,
+		       matching webgpu_compute_birds (r171) BIRDS=16384 EXACTLY. BOUNDS=800
+		       also matches the WebGPU example.
 		     Read the Stats panel (top-left): click it to switch FPS -> MS. -->
 		<script type="importmap">
 			{
@@ -324,11 +323,11 @@
 			import { GPUComputationRenderer } from 'three/addons/misc/GPUComputationRenderer.js';
 
 			/* TEXTURE WIDTH FOR SIMULATION */
-			/* MODIFIED: was 32 (1024 birds). URL-tunable; default 90 -> 8100 birds
-			   to match webgpu_compute_birds (BIRDS=8192). O(N^2) sim, so this is the
-			   load knob. e.g. ?width=90 (8100), ?width=64 (4096), ?width=128 (16384). */
+			/* MODIFIED: was 32 (1024 birds). URL-tunable; default 128 -> 16384 birds
+			   to match webgpu_compute_birds (r171 BIRDS=16384) EXACTLY. O(N^2) sim, so
+			   this is the load knob. e.g. ?width=128 (16384), ?width=90 (8100), ?width=64 (4096). */
 			const WIDTH = Math.max( 4,
-				parseInt( new URLSearchParams( location.search ).get( 'width' ) || '90', 10 ) );
+				parseInt( new URLSearchParams( location.search ).get( 'width' ) || '128', 10 ) );
 
 			const BIRDS = WIDTH * WIDTH;
 
