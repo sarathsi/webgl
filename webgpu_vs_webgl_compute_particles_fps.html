@@ -21,10 +21,19 @@
 
   URL params:
     ?api=webgpu | webgl | auto   (default auto = WebGPU if available else WebGL2)
-    ?count=N                     (particles, default 300000)
+    ?count=N                     (particles, default 500000)
+    ?work=K                      (force evals per particle per frame, default 16 —
+                                  the heaviness knob; raise it to push WebGL down)
     ?seconds=S                   (measure S s after warmup then print summary; 0=forever)
     ?warmup=F                    (frames skipped before measuring, default 60)
   Keyboard: 'r' restarts the measurement window.
+
+  Tuning to make WebGL fall below 50 FPS while WebGPU holds:
+    - Both run the SAME physics (K force samples around the attractor, averaged),
+      so it stays fair. WebGL does K*count evals on the CPU (JS) each frame and
+      re-uploads the buffer; WebGPU does them in parallel on the GPU, in place.
+    - If both still hit vsync, raise ?work (e.g. 32, 64) and/or ?count.
+    - If WebGPU also dips, lower ?count a bit — you want WebGL CPU-bound, WebGPU not.
 -->
 <html lang="en">
 <head>
@@ -52,7 +61,8 @@
 // ---------------------------------------------------------------- params
 const Q = new URLSearchParams(location.search);
 const API = (Q.get("api") || "auto").toLowerCase();
-const COUNT = Math.max(1, parseInt(Q.get("count") || "300000", 10));
+const COUNT = Math.max(1, parseInt(Q.get("count") || "500000", 10));
+const WORK = Math.max(1, parseInt(Q.get("work") || "16", 10));
 const SECONDS = parseFloat(Q.get("seconds") || "0");
 const WARMUP = parseInt(Q.get("warmup") || "60", 10);
 
@@ -121,14 +131,23 @@ function initWebGL(){
     resize(){ gl.viewport(0,0,canvas.width,canvas.height); },
     frame(t){
       // ---- physics on CPU (no compute shaders in WebGL2) ----
+      // K force samples on a small ring around the attractor, averaged.
+      // Cost scales with WORK*COUNT — this is what pushes WebGL down.
       const [ax,ay]=attractorAt(t);
+      const RING=0.05, invK=1/WORK;
       for(let i=0;i<COUNT;i++){
         const o=i*4;
         let px=cpu[o], py=cpu[o+1], vx=cpu[o+2], vy=cpu[o+3];
-        const dx=ax-px, dy=ay-py;
-        const d2=Math.max(dx*dx+dy*dy,0.01);
-        const f=GRAV/d2;
-        vx=(vx+dx*f)*DAMP; vy=(vy+dy*f)*DAMP;
+        let fx=0, fy=0;
+        for(let k=0;k<WORK;k++){
+          const a=t*0.5 + k*6.2831853/WORK;
+          const sx=ax+Math.cos(a)*RING, sy=ay+Math.sin(a)*RING;
+          const dx=sx-px, dy=sy-py;
+          const d2=Math.max(dx*dx+dy*dy,0.01);
+          const f=GRAV/d2;
+          fx+=dx*f; fy+=dy*f;
+        }
+        vx=(vx+fx*invK)*DAMP; vy=(vy+fy*invK)*DAMP;
         px+=vx; py+=vy;
         if(px<-1||px>1){vx=-vx; px=px<-1?-1:1;}
         if(py<-1||py>1){vy=-vy; py=py<-1?-1:1;}
@@ -165,27 +184,36 @@ async function initWebGPU(){
     usage:GPUBufferUsage.STORAGE|GPUBufferUsage.VERTEX|GPUBufferUsage.COPY_DST});
   device.queue.writeBuffer(partBuf,0,INIT);
 
-  // uniform: attractor.xy, dt, count
-  const uBuf=device.createBuffer({size:16, usage:GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST});
-  const uData=new ArrayBuffer(16);
+  // uniform: attractor.xy, dt, count, work, time
+  const uBuf=device.createBuffer({size:32, usage:GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST});
+  const uData=new ArrayBuffer(32);
   const uF=new Float32Array(uData), uU=new Uint32Array(uData);
 
   const computeMod=device.createShaderModule({code:`
     struct P { pos: vec2<f32>, vel: vec2<f32> };
-    struct U { attractor: vec2<f32>, dt: f32, count: u32 };
+    struct U { attractor: vec2<f32>, dt: f32, count: u32, work: u32, time: f32 };
     @group(0) @binding(0) var<storage, read_write> parts: array<P>;
     @group(0) @binding(1) var<uniform> u: U;
     const GRAV: f32 = ${GRAV};
     const DAMP: f32 = ${DAMP};
+    const RING: f32 = 0.05;
     @compute @workgroup_size(64)
     fn cs(@builtin(global_invocation_id) gid: vec3<u32>){
       let i = gid.x;
       if (i >= u.count) { return; }
       var p = parts[i];
-      let d = u.attractor - p.pos;
-      let d2 = max(dot(d,d), 0.01);
-      let f = GRAV / d2;
-      p.vel = (p.vel + d*f) * DAMP;
+      // K force samples on a ring around the attractor, averaged (matches CPU path).
+      var fx: f32 = 0.0; var fy: f32 = 0.0;
+      let invK = 1.0 / f32(u.work);
+      for (var k: u32 = 0u; k < u.work; k = k + 1u){
+        let a = u.time*0.5 + f32(k)*6.2831853/f32(u.work);
+        let s = u.attractor + vec2<f32>(cos(a)*RING, sin(a)*RING);
+        let d = s - p.pos;
+        let d2 = max(dot(d,d), 0.01);
+        let f = GRAV / d2;
+        fx = fx + d.x*f; fy = fy + d.y*f;
+      }
+      p.vel = (p.vel + vec2<f32>(fx,fy)*invK) * DAMP;
       p.pos = p.pos + p.vel;
       if (p.pos.x < -1.0 || p.pos.x > 1.0){ p.vel.x = -p.vel.x; p.pos.x = clamp(p.pos.x,-1.0,1.0); }
       if (p.pos.y < -1.0 || p.pos.y > 1.0){ p.vel.y = -p.vel.y; p.pos.y = clamp(p.pos.y,-1.0,1.0); }
@@ -220,7 +248,7 @@ async function initWebGPU(){
     resize(){},
     frame(t){
       const [ax,ay]=attractorAt(t);
-      uF[0]=ax; uF[1]=ay; uF[2]=0.016; uU[3]=COUNT;
+      uF[0]=ax; uF[1]=ay; uF[2]=0.016; uU[3]=COUNT; uU[4]=WORK; uF[5]=t;
       device.queue.writeBuffer(uBuf,0,uData);
       const enc=device.createCommandEncoder();
       const cp=enc.beginComputePass();
@@ -251,14 +279,14 @@ function finalize(){
     slow_gt33ms:s.filter(x=>x>33.3).length};
   summary.textContent=
     `=== RESULT (${backend.name}) ===\n`+
-    `particles : ${COUNT}\n`+
+    `particles : ${COUNT} × work ${WORK}\n`+
     `frames    : ${r.frames}\n`+
     `mean FPS  : ${r.meanFps}\n`+
     `p50/p95/p99 ms : ${r.p50ms} / ${r.p95ms} / ${r.p99ms}\n`+
     `min/max ms     : ${r.minms} / ${r.maxms}\n`+
     `slow >33ms     : ${r.slow_gt33ms}`;
-  console.log("[compute A/B]",{api:backend.name,particles:COUNT,...r});
-  console.table([{api:backend.name,particles:COUNT,...r}]);
+  console.log("[compute A/B]",{api:backend.name,particles:COUNT,work:WORK,...r});
+  console.table([{api:backend.name,particles:COUNT,work:WORK,...r}]);
 }
 
 // ---------------------------------------------------------------- main loop
@@ -285,7 +313,7 @@ function loop(now){
     if(SECONDS>0&&(now-collectStart)/1000>=SECONDS) finalize();
   }
   hud.textContent=
-    `${backend.name}  |  ${COUNT.toLocaleString()} particles\n`+
+    `${backend.name}  |  ${COUNT.toLocaleString()} particles × work ${WORK}\n`+
     `FPS ${rfps.toFixed(1)}   frame ${dt.toFixed(2)} ms\n`+
     `${backend.info}\n`+
     (SECONDS>0
