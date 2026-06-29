@@ -1,7 +1,6 @@
 <!DOCTYPE html>
 <!--
-  WebGPU vs WebGL2 — COMPUTE-bound particle benchmark (where WebGPU can win).
-  Self-contained, no network deps. Works offline on the OHOS device.
+  WebGPU vs WebGL2 — COMPUTE-bound particle benchmark
 
   Why this favors WebGPU (unlike a draw-call-bound raster test):
     * WebGPU  : a COMPUTE shader integrates N particles on the GPU, in place.
@@ -12,7 +11,7 @@
     (2) no per-frame CPU→GPU upload. Rendering is cheap (1px points) on both, so
     the integrator — not rasterization — is the bottleneck.
 
-  IMPORTANT (OHOS compat caveat):
+  IMPORTANT:
     * With Vulkan ON  (Dawn→Vulkan): WebGPU compute is a genuine native win.
     * With Vulkan OFF (Dawn→OpenGLES→ANGLE→GLES): WebGPU compute needs GLES 3.1
       compute via ANGLE. If unavailable, WebGPU device/compute init fails and the
@@ -28,7 +27,7 @@
     ?warmup=F                    (frames skipped before measuring, default 60)
   Keyboard: 'r' restarts the measurement window.
 
-  Tuning to make WebGL fall below 50 FPS while WebGPU holds:
+  Tune the test:
     - Both run the SAME physics (K force samples around the attractor, averaged),
       so it stays fair. WebGL does K*count evals on the CPU (JS) each frame and
       re-uploads the buffer; WebGPU does them in parallel on the GPU, in place.
@@ -331,7 +330,7 @@ function loop(now){
     else{ try{backend=await initWebGPU();}catch(e){console.warn("WebGPU unavailable → WebGL2:",e.message);backend=initWebGL();} }
   }catch(e){
     hud.textContent="INIT FAILED: "+e.message;
-    summary.textContent="If you forced ?api=webgpu and WebGPU is off,\nor GLES compute is unavailable on this device,\nthis is expected — see the OHOS compat caveat in the header.";
+    summary.textContent="If you forced ?api=webgpu and WebGPU is off,\nor GLES compute is unavailable on this device,\nthis is expected.";
     return;
   }
   resize();
