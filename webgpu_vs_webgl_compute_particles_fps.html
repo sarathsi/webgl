@@ -1,0 +1,314 @@
+<!DOCTYPE html>
+<!--
+  WebGPU vs WebGL2 — COMPUTE-bound particle benchmark (where WebGPU can win).
+  Self-contained, no network deps. Works offline on the OHOS device.
+
+  Why this favors WebGPU (unlike a draw-call-bound raster test):
+    * WebGPU  : a COMPUTE shader integrates N particles on the GPU, in place.
+                Data never leaves the GPU between frames.
+    * WebGL2  : has NO compute shaders, so the same physics runs on the CPU (JS),
+                then the whole particle buffer is re-uploaded every frame.
+    So WebGPU wins twice: (1) parallel GPU compute vs single-threaded JS, and
+    (2) no per-frame CPU→GPU upload. Rendering is cheap (1px points) on both, so
+    the integrator — not rasterization — is the bottleneck.
+
+  IMPORTANT (OHOS compat caveat):
+    * With Vulkan ON  (Dawn→Vulkan): WebGPU compute is a genuine native win.
+    * With Vulkan OFF (Dawn→OpenGLES→ANGLE→GLES): WebGPU compute needs GLES 3.1
+      compute via ANGLE. If unavailable, WebGPU device/compute init fails and the
+      HUD says so — that itself is the finding (raster WebGPU never beats WebGL on
+      the GLES compat stack; compute is the only place it can).
+
+  URL params:
+    ?api=webgpu | webgl | auto   (default auto = WebGPU if available else WebGL2)
+    ?count=N                     (particles, default 300000)
+    ?seconds=S                   (measure S s after warmup then print summary; 0=forever)
+    ?warmup=F                    (frames skipped before measuring, default 60)
+  Keyboard: 'r' restarts the measurement window.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>WebGPU vs WebGL — compute particles</title>
+<style>
+  html,body{margin:0;height:100%;overflow:hidden;background:#05060a;}
+  canvas{display:block;width:100vw;height:100vh;}
+  #hud{position:fixed;top:8px;left:8px;padding:8px 10px;font:12px/1.4 monospace;
+       color:#e8e8ec;background:rgba(0,0,0,.55);border-radius:6px;white-space:pre;
+       pointer-events:none;z-index:10;}
+  #summary{position:fixed;top:8px;right:8px;padding:8px 10px;font:12px/1.4 monospace;
+       color:#aef0c0;background:rgba(0,0,0,.6);border-radius:6px;white-space:pre;
+       z-index:10;max-width:48vw;}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hud">starting…</div>
+<div id="summary"></div>
+<script>
+"use strict";
+
+// ---------------------------------------------------------------- params
+const Q = new URLSearchParams(location.search);
+const API = (Q.get("api") || "auto").toLowerCase();
+const COUNT = Math.max(1, parseInt(Q.get("count") || "300000", 10));
+const SECONDS = parseFloat(Q.get("seconds") || "0");
+const WARMUP = parseInt(Q.get("warmup") || "60", 10);
+
+const hud = document.getElementById("hud");
+const summary = document.getElementById("summary");
+const canvas = document.getElementById("c");
+
+// ---------------------------------------------------------------- initial particle data
+// Layout per particle: [posX, posY, velX, velY] in clip space [-1,1].
+const STRIDE = 4;
+function makeParticles(n){
+  const a = new Float32Array(n * STRIDE);
+  for (let i = 0; i < n; i++){
+    const r = Math.sqrt(Math.random()) * 0.9;
+    const t = Math.random() * Math.PI * 2;
+    a[i*4+0] = Math.cos(t) * r;
+    a[i*4+1] = Math.sin(t) * r;
+    // small tangential velocity → swirl
+    a[i*4+2] = -Math.sin(t) * 0.002;
+    a[i*4+3] =  Math.cos(t) * 0.002;
+  }
+  return a;
+}
+const INIT = makeParticles(COUNT);
+
+// Shared physics constants (kept identical between CPU and GPU integrators).
+const GRAV = 0.00045, DAMP = 0.999;
+function attractorAt(t){ return [Math.cos(t*0.7)*0.5, Math.sin(t*0.9)*0.5]; }
+
+// ---------------------------------------------------------------- WebGL2 backend (CPU physics)
+function initWebGL(){
+  const gl = canvas.getContext("webgl2", {antialias:false, powerPreference:"high-performance"});
+  if (!gl) throw new Error("WebGL2 unavailable");
+  const sh=(t,s)=>{const o=gl.createShader(t);gl.shaderSource(o,s);gl.compileShader(o);
+    if(!gl.getShaderParameter(o,gl.COMPILE_STATUS))throw new Error(gl.getShaderInfoLog(o));return o;};
+  const VS=`#version 300 es
+    layout(location=0) in vec2 aPos;
+    layout(location=1) in vec2 aVel;
+    out vec3 vColor;
+    void main(){
+      gl_Position=vec4(aPos,0.0,1.0); gl_PointSize=1.0;
+      float sp=clamp(length(aVel)*60.0,0.0,1.0);
+      vColor=mix(vec3(0.10,0.30,0.95), vec3(1.0,0.9,0.25), sp);
+    }`;
+  const FS=`#version 300 es
+    precision mediump float; in vec3 vColor; out vec4 o;
+    void main(){ o=vec4(vColor,1.0); }`;
+  const prog=gl.createProgram();
+  gl.attachShader(prog,sh(gl.VERTEX_SHADER,VS));
+  gl.attachShader(prog,sh(gl.FRAGMENT_SHADER,FS));
+  gl.linkProgram(prog);
+  if(!gl.getProgramParameter(prog,gl.LINK_STATUS))throw new Error(gl.getProgramInfoLog(prog));
+  gl.useProgram(prog);
+
+  const cpu = INIT.slice();               // CPU-side working copy
+  const vao=gl.createVertexArray(); gl.bindVertexArray(vao);
+  const buf=gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER,buf);
+  gl.bufferData(gl.ARRAY_BUFFER, cpu.byteLength, gl.DYNAMIC_DRAW);
+  gl.vertexAttribPointer(0,2,gl.FLOAT,false,16,0); gl.enableVertexAttribArray(0);
+  gl.vertexAttribPointer(1,2,gl.FLOAT,false,16,8); gl.enableVertexAttribArray(1);
+  gl.clearColor(0.02,0.02,0.04,1);
+
+  return {
+    name:"WebGL2 (CPU physics)",
+    info: gl.getParameter(gl.RENDERER),
+    resize(){ gl.viewport(0,0,canvas.width,canvas.height); },
+    frame(t){
+      // ---- physics on CPU (no compute shaders in WebGL2) ----
+      const [ax,ay]=attractorAt(t);
+      for(let i=0;i<COUNT;i++){
+        const o=i*4;
+        let px=cpu[o], py=cpu[o+1], vx=cpu[o+2], vy=cpu[o+3];
+        const dx=ax-px, dy=ay-py;
+        const d2=Math.max(dx*dx+dy*dy,0.01);
+        const f=GRAV/d2;
+        vx=(vx+dx*f)*DAMP; vy=(vy+dy*f)*DAMP;
+        px+=vx; py+=vy;
+        if(px<-1||px>1){vx=-vx; px=px<-1?-1:1;}
+        if(py<-1||py>1){vy=-vy; py=py<-1?-1:1;}
+        cpu[o]=px; cpu[o+1]=py; cpu[o+2]=vx; cpu[o+3]=vy;
+      }
+      // ---- re-upload whole buffer every frame ----
+      gl.bindBuffer(gl.ARRAY_BUFFER,buf);
+      gl.bufferSubData(gl.ARRAY_BUFFER,0,cpu);
+      gl.viewport(0,0,canvas.width,canvas.height);
+      gl.clear(gl.COLOR_BUFFER_BIT);
+      gl.drawArrays(gl.POINTS,0,COUNT);
+    }
+  };
+}
+
+// ---------------------------------------------------------------- WebGPU backend (GPU compute)
+async function initWebGPU(){
+  if(!navigator.gpu) throw new Error("navigator.gpu undefined (WebGPU disabled)");
+  const adapter=await navigator.gpu.requestAdapter({powerPreference:"high-performance"});
+  if(!adapter) throw new Error("requestAdapter() returned null");
+  const device=await adapter.requestDevice();
+  if (device.addEventListener) device.addEventListener("uncapturederror",
+    e=>console.error("WebGPU error:", (e.error&&e.error.message)||e));
+  const ctx=canvas.getContext("webgpu");
+  const format=navigator.gpu.getPreferredCanvasFormat();
+  ctx.configure({device,format,alphaMode:"opaque"});
+
+  let info="WebGPU (GPU compute)";
+  try{const ai=adapter.info||(adapter.requestAdapterInfo&&await adapter.requestAdapterInfo());
+      if(ai) info=`WebGPU compute | ${ai.vendor||""} ${ai.architecture||""} ${ai.device||""} ${ai.backend||""}`.trim();}catch(e){}
+
+  // particle buffer: STORAGE (compute r/w) + VERTEX (render read)
+  const partBuf=device.createBuffer({size:INIT.byteLength,
+    usage:GPUBufferUsage.STORAGE|GPUBufferUsage.VERTEX|GPUBufferUsage.COPY_DST});
+  device.queue.writeBuffer(partBuf,0,INIT);
+
+  // uniform: attractor.xy, dt, count
+  const uBuf=device.createBuffer({size:16, usage:GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST});
+  const uData=new ArrayBuffer(16);
+  const uF=new Float32Array(uData), uU=new Uint32Array(uData);
+
+  const computeMod=device.createShaderModule({code:`
+    struct P { pos: vec2<f32>, vel: vec2<f32> };
+    struct U { attractor: vec2<f32>, dt: f32, count: u32 };
+    @group(0) @binding(0) var<storage, read_write> parts: array<P>;
+    @group(0) @binding(1) var<uniform> u: U;
+    const GRAV: f32 = ${GRAV};
+    const DAMP: f32 = ${DAMP};
+    @compute @workgroup_size(64)
+    fn cs(@builtin(global_invocation_id) gid: vec3<u32>){
+      let i = gid.x;
+      if (i >= u.count) { return; }
+      var p = parts[i];
+      let d = u.attractor - p.pos;
+      let d2 = max(dot(d,d), 0.01);
+      let f = GRAV / d2;
+      p.vel = (p.vel + d*f) * DAMP;
+      p.pos = p.pos + p.vel;
+      if (p.pos.x < -1.0 || p.pos.x > 1.0){ p.vel.x = -p.vel.x; p.pos.x = clamp(p.pos.x,-1.0,1.0); }
+      if (p.pos.y < -1.0 || p.pos.y > 1.0){ p.vel.y = -p.vel.y; p.pos.y = clamp(p.pos.y,-1.0,1.0); }
+      parts[i] = p;
+    }`});
+  const renderMod=device.createShaderModule({code:`
+    struct VSOut { @builtin(position) pos: vec4<f32>, @location(0) color: vec3<f32> };
+    @vertex fn vs(@location(0) pos: vec2<f32>, @location(1) vel: vec2<f32>) -> VSOut {
+      var o: VSOut; o.pos = vec4<f32>(pos, 0.0, 1.0);
+      let sp = clamp(length(vel)*60.0, 0.0, 1.0);
+      o.color = mix(vec3<f32>(0.10,0.30,0.95), vec3<f32>(1.0,0.9,0.25), sp);
+      return o;
+    }
+    @fragment fn fs(in: VSOut) -> @location(0) vec4<f32> { return vec4<f32>(in.color,1.0); }`});
+
+  const computePipe=device.createComputePipeline({layout:"auto",
+    compute:{module:computeMod,entryPoint:"cs"}});
+  const renderPipe=device.createRenderPipeline({layout:"auto",
+    vertex:{module:renderMod,entryPoint:"vs",buffers:[
+      {arrayStride:16,attributes:[
+        {shaderLocation:0,offset:0,format:"float32x2"},
+        {shaderLocation:1,offset:8,format:"float32x2"}]}]},
+    fragment:{module:renderMod,entryPoint:"fs",targets:[{format}]},
+    primitive:{topology:"point-list"}});
+
+  const cbind=device.createBindGroup({layout:computePipe.getBindGroupLayout(0),
+    entries:[{binding:0,resource:{buffer:partBuf}},{binding:1,resource:{buffer:uBuf}}]});
+
+  const groups=Math.ceil(COUNT/64);
+  return {
+    name:"WebGPU (GPU compute)", info,
+    resize(){},
+    frame(t){
+      const [ax,ay]=attractorAt(t);
+      uF[0]=ax; uF[1]=ay; uF[2]=0.016; uU[3]=COUNT;
+      device.queue.writeBuffer(uBuf,0,uData);
+      const enc=device.createCommandEncoder();
+      const cp=enc.beginComputePass();
+      cp.setPipeline(computePipe); cp.setBindGroup(0,cbind);
+      cp.dispatchWorkgroups(groups); cp.end();
+      const rp=enc.beginRenderPass({colorAttachments:[{
+        view:ctx.getCurrentTexture().createView(),
+        clearValue:{r:0.02,g:0.02,b:0.04,a:1},loadOp:"clear",storeOp:"store"}]});
+      rp.setPipeline(renderPipe); rp.setVertexBuffer(0,partBuf);
+      rp.draw(COUNT); rp.end();
+      device.queue.submit([enc.finish()]);
+    }
+  };
+}
+
+// ---------------------------------------------------------------- stats (same as cubes test)
+let samples=[],frameNo=0,collecting=false,collectStart=0,done=false,rolling=[];
+function resetStats(){samples=[];frameNo=0;collecting=false;done=false;rolling=[];summary.textContent="";}
+function finalize(){
+  done=true;collecting=false;
+  if(!samples.length){summary.textContent="no samples";return;}
+  const s=[...samples].sort((a,b)=>a-b);
+  const mean=s.reduce((a,b)=>a+b,0)/s.length;
+  const p=q=>s[Math.min(s.length-1,Math.floor(s.length*q))];
+  const r={frames:s.length,meanFps:+(1000/mean).toFixed(1),
+    p50ms:+p(.5).toFixed(2),p95ms:+p(.95).toFixed(2),p99ms:+p(.99).toFixed(2),
+    minms:+s[0].toFixed(2),maxms:+s[s.length-1].toFixed(2),
+    slow_gt33ms:s.filter(x=>x>33.3).length};
+  summary.textContent=
+    `=== RESULT (${backend.name}) ===\n`+
+    `particles : ${COUNT}\n`+
+    `frames    : ${r.frames}\n`+
+    `mean FPS  : ${r.meanFps}\n`+
+    `p50/p95/p99 ms : ${r.p50ms} / ${r.p95ms} / ${r.p99ms}\n`+
+    `min/max ms     : ${r.minms} / ${r.maxms}\n`+
+    `slow >33ms     : ${r.slow_gt33ms}`;
+  console.log("[compute A/B]",{api:backend.name,particles:COUNT,...r});
+  console.table([{api:backend.name,particles:COUNT,...r}]);
+}
+
+// ---------------------------------------------------------------- main loop
+let backend=null,t0=0,prev=0;
+function resize(){
+  const dpr=Math.min(window.devicePixelRatio||1,2);
+  canvas.width=Math.floor(innerWidth*dpr);
+  canvas.height=Math.floor(innerHeight*dpr);
+  if(backend) backend.resize();
+}
+addEventListener("resize",resize);
+addEventListener("keydown",e=>{if(e.key==="r")resetStats();});
+
+function loop(now){
+  if(!t0){t0=now;prev=now;}
+  const t=(now-t0)/1000;
+  backend.frame(t);
+  const dt=now-prev; prev=now; frameNo++;
+  rolling.push(dt); if(rolling.length>30)rolling.shift();
+  const rfps=1000/(rolling.reduce((a,b)=>a+b,0)/rolling.length);
+  if(!done&&frameNo>WARMUP){
+    if(!collecting){collecting=true;collectStart=now;}
+    samples.push(dt);
+    if(SECONDS>0&&(now-collectStart)/1000>=SECONDS) finalize();
+  }
+  hud.textContent=
+    `${backend.name}  |  ${COUNT.toLocaleString()} particles\n`+
+    `FPS ${rfps.toFixed(1)}   frame ${dt.toFixed(2)} ms\n`+
+    `${backend.info}\n`+
+    (SECONDS>0
+      ? (done?`measure: DONE (press 'r' to rerun)`
+             :(collecting?`measure: ${((now-collectStart)/1000).toFixed(1)}/${SECONDS}s`:`warmup…`))
+      : `measure: rolling (add ?seconds=10 for a summary)`);
+  requestAnimationFrame(loop);
+}
+
+(async function start(){
+  resize();
+  try{
+    if(API==="webgl")      backend=initWebGL();
+    else if(API==="webgpu")backend=await initWebGPU();
+    else{ try{backend=await initWebGPU();}catch(e){console.warn("WebGPU unavailable → WebGL2:",e.message);backend=initWebGL();} }
+  }catch(e){
+    hud.textContent="INIT FAILED: "+e.message;
+    summary.textContent="If you forced ?api=webgpu and WebGPU is off,\nor GLES compute is unavailable on this device,\nthis is expected — see the OHOS compat caveat in the header.";
+    return;
+  }
+  resize();
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
