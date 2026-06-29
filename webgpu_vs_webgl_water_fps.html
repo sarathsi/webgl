@@ -1,0 +1,370 @@
+<!DOCTYPE html>
+<!--
+  WebGPU vs WebGL2 — heightfield WATER (wave) simulation A/B.
+  Self-contained, no network deps. Works offline on the OHOS device.
+
+  Same scene + same physics on both backends:
+    * A gridN×gridN heightfield. Each cell holds (height, velocity).
+    * Each sub-step: 2D wave equation — vel += C*(laplacian of height); vel *= damp;
+      height += vel. Reflecting edges. Periodic "rain" drops add ripples.
+    * Rendered identically: one 1px point per cell, position from the grid index,
+      colour from height. Rendering is deliberately cheap so the SIM is the bottleneck.
+
+  Backends:
+    * WebGPU : a COMPUTE shader does the wave update on ping-pong storage buffers,
+               in place — data never leaves the GPU between frames.
+    * WebGL2 : has no compute, so the identical wave math runs on the CPU (JS) with
+               ping-pong typed arrays, then the height buffer is re-uploaded every frame.
+    So WebGPU wins twice: parallel GPU compute vs single-threaded JS, and no per-frame
+    CPU→GPU upload.
+
+  IMPORTANT (OHOS):
+    * Vulkan ON  (Dawn→Vulkan): genuine native WebGPU compute win.
+    * Vulkan OFF (compat, Dawn→GLES→ANGLE): needs GLES 3.1 compute via ANGLE; if
+      unavailable, WebGPU init fails and the HUD says so.
+
+  URL params:
+    ?api=webgpu | webgl | auto   (default auto = WebGPU if available else WebGL2)
+    ?count=N                     (target cell count; grid = round(sqrt(N))², default 250000)
+    ?work=K                      (wave sub-steps per frame, default 2 — the heaviness knob;
+                                  cost ∝ WORK × cells. Raise to push WebGL below vsync.)
+    ?seconds=S                   (measure S s after warmup then print summary; 0=forever)
+    ?warmup=F                    (frames skipped before measuring, default 60)
+  Keyboard: 'r' restarts the measurement window.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>WebGPU vs WebGL — water</title>
+<style>
+  html,body{margin:0;height:100%;overflow:hidden;background:#020308;}
+  canvas{display:block;width:100vw;height:100vh;}
+  #hud{position:fixed;top:8px;left:8px;padding:8px 10px;font:12px/1.4 monospace;
+       color:#e8e8ec;background:rgba(0,0,0,.55);border-radius:6px;white-space:pre;
+       pointer-events:none;z-index:10;}
+  #summary{position:fixed;top:8px;right:8px;padding:8px 10px;font:12px/1.4 monospace;
+       color:#aef0c0;background:rgba(0,0,0,.6);border-radius:6px;white-space:pre;
+       z-index:10;max-width:48vw;}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hud">starting…</div>
+<div id="summary"></div>
+<script>
+"use strict";
+
+// ---------------------------------------------------------------- params
+const Q = new URLSearchParams(location.search);
+const API = (Q.get("api") || "auto").toLowerCase();
+const COUNT = Math.max(16, parseInt(Q.get("count") || "250000", 10));
+const WORK = Math.max(1, parseInt(Q.get("work") || "2", 10));
+const SECONDS = parseFloat(Q.get("seconds") || "0");
+const WARMUP = parseInt(Q.get("warmup") || "60", 10);
+
+const N = Math.round(Math.sqrt(COUNT));   // grid side
+const CELLS = N * N;
+
+const hud = document.getElementById("hud");
+const summary = document.getElementById("summary");
+const canvas = document.getElementById("c");
+
+// ---------------------------------------------------------------- shared physics constants
+const WAVE_C = 0.20;        // wave speed factor (explicit scheme stable for <=0.5)
+const DAMP   = 0.996;       // velocity damping
+const DROP_INTERVAL = 45;   // frames between rain drops
+const DROP_AMP = 0.6;       // drop height
+const DROP_R = Math.max(3, Math.floor(N * 0.03));   // drop radius (cells)
+const DROP_R2 = DROP_R * DROP_R;
+
+// deterministic pseudo-random drop position (so both backends get identical input)
+let dropSeed = 1234567;
+function nextRand(){ dropSeed = (dropSeed * 1103515245 + 12345) & 0x7fffffff; return dropSeed / 0x7fffffff; }
+// Returns {amp,x,y} for a given frame (amp 0 on non-drop frames). Shared by both backends.
+let _frameDrops = [];
+function dropForFrame(frameNo){
+  if (_frameDrops[frameNo] !== undefined) return _frameDrops[frameNo];
+  let d = {amp:0, x:0, y:0};
+  if (frameNo === 0){ d = {amp:DROP_AMP, x:(N>>1), y:(N>>1)}; }     // initial splash
+  else if (frameNo % DROP_INTERVAL === 0){
+    d = {amp:DROP_AMP, x:Math.floor(nextRand()*N), y:Math.floor(nextRand()*N)};
+  }
+  _frameDrops[frameNo] = d;
+  return d;
+}
+
+// ---------------------------------------------------------------- WebGL2 backend (CPU wave)
+function initWebGL(){
+  const gl = canvas.getContext("webgl2", {antialias:false, powerPreference:"high-performance"});
+  if (!gl) throw new Error("WebGL2 unavailable");
+  const sh=(t,s)=>{const o=gl.createShader(t);gl.shaderSource(o,s);gl.compileShader(o);
+    if(!gl.getShaderParameter(o,gl.COMPILE_STATUS))throw new Error(gl.getShaderInfoLog(o));return o;};
+  const VS=`#version 300 es
+    layout(location=0) in float aH;
+    uniform int uN;
+    out vec3 vColor;
+    void main(){
+      int gx = gl_VertexID % uN;
+      int gy = gl_VertexID / uN;
+      float x = float(gx)/float(uN-1)*2.0-1.0;
+      float y = float(gy)/float(uN-1)*2.0-1.0;
+      gl_Position=vec4(x,y,0.0,1.0); gl_PointSize=1.0;
+      float c=clamp(aH*2.5+0.5,0.0,1.0);
+      vColor=mix(vec3(0.0,0.12,0.35), vec3(0.65,0.88,1.0), c);
+    }`;
+  const FS=`#version 300 es
+    precision mediump float; in vec3 vColor; out vec4 o;
+    void main(){ o=vec4(vColor,1.0); }`;
+  const prog=gl.createProgram();
+  gl.attachShader(prog,sh(gl.VERTEX_SHADER,VS));
+  gl.attachShader(prog,sh(gl.FRAGMENT_SHADER,FS));
+  gl.linkProgram(prog);
+  if(!gl.getProgramParameter(prog,gl.LINK_STATUS))throw new Error(gl.getProgramInfoLog(prog));
+  gl.useProgram(prog);
+  gl.uniform1i(gl.getUniformLocation(prog,"uN"), N);
+
+  let hPrev=new Float32Array(CELLS), hNext=new Float32Array(CELLS), vel=new Float32Array(CELLS);
+  const vao=gl.createVertexArray(); gl.bindVertexArray(vao);
+  const buf=gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER,buf);
+  gl.bufferData(gl.ARRAY_BUFFER, hPrev.byteLength, gl.DYNAMIC_DRAW);
+  gl.vertexAttribPointer(0,1,gl.FLOAT,false,4,0); gl.enableVertexAttribArray(0);
+  gl.clearColor(0.01,0.012,0.03,1);
+
+  let frame=0;
+  function step(drop){
+    for(let gy=0;gy<N;gy++){
+      const row=gy*N;
+      const ym=gy>0?gy-1:gy, yp=gy<N-1?gy+1:gy;
+      for(let gx=0;gx<N;gx++){
+        const i=row+gx;
+        const c=hPrev[i];
+        const xm=gx>0?gx-1:gx, xp=gx<N-1?gx+1:gx;
+        const lap=hPrev[row+xm]+hPrev[row+xp]+hPrev[ym*N+gx]+hPrev[yp*N+gx]-4.0*c;
+        let v=(vel[i]+lap*WAVE_C)*DAMP;
+        let h=c+v;
+        if(drop.amp>0){
+          const dx=gx-drop.x, dy=gy-drop.y, d2=dx*dx+dy*dy;
+          if(d2<DROP_R2) h+=drop.amp*(1.0-d2/DROP_R2);
+        }
+        vel[i]=v; hNext[i]=h;
+      }
+    }
+    const t=hPrev; hPrev=hNext; hNext=t;   // swap → hPrev holds latest
+  }
+
+  return {
+    name:"WebGL2 (CPU wave)",
+    info: gl.getParameter(gl.RENDERER),
+    resize(){ gl.viewport(0,0,canvas.width,canvas.height); },
+    frame(){
+      for(let k=0;k<WORK;k++){ step(k===0?dropForFrame(frame):{amp:0,x:0,y:0}); }
+      frame++;
+      gl.bindBuffer(gl.ARRAY_BUFFER,buf);
+      gl.bufferSubData(gl.ARRAY_BUFFER,0,hPrev);
+      gl.viewport(0,0,canvas.width,canvas.height);
+      gl.clear(gl.COLOR_BUFFER_BIT);
+      gl.drawArrays(gl.POINTS,0,CELLS);
+    }
+  };
+}
+
+// ---------------------------------------------------------------- WebGPU backend (GPU compute wave)
+async function initWebGPU(){
+  if(!navigator.gpu) throw new Error("navigator.gpu undefined (WebGPU disabled)");
+  const adapter=await navigator.gpu.requestAdapter({powerPreference:"high-performance"});
+  if(!adapter) throw new Error("requestAdapter() returned null");
+  const device=await adapter.requestDevice();
+  if(device.addEventListener) device.addEventListener("uncapturederror",
+    e=>console.error("WebGPU error:", (e.error&&e.error.message)||e));
+  const ctx=canvas.getContext("webgpu");
+  const format=navigator.gpu.getPreferredCanvasFormat();
+  ctx.configure({device,format,alphaMode:"opaque"});
+
+  let info="WebGPU (GPU compute wave)";
+  try{const ai=adapter.info||(adapter.requestAdapterInfo&&await adapter.requestAdapterInfo());
+      if(ai) info=`WebGPU compute | ${ai.vendor||""} ${ai.architecture||""} ${ai.device||""} ${ai.backend||""}`.trim();}catch(e){}
+
+  const bytes = CELLS*4;
+  const mk=(extra)=>device.createBuffer({size:bytes, usage:GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST|extra});
+  const hA=mk(GPUBufferUsage.VERTEX), hB=mk(GPUBufferUsage.VERTEX), vel=mk(0);
+  // (buffers start zero-initialized by the implementation)
+
+  // uniform: n(u32), C(f32), damp(f32), dropX(f32), dropY(f32), dropAmp(f32), dropR2(f32), pad
+  const uBuf=device.createBuffer({size:32, usage:GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST});
+  const uAB=new ArrayBuffer(32), uF=new Float32Array(uAB), uU=new Uint32Array(uAB);
+  uU[0]=N; uF[1]=WAVE_C; uF[2]=DAMP; uF[6]=DROP_R2;
+
+  const computeMod=device.createShaderModule({code:`
+    struct U { n:u32, c:f32, damp:f32, dropX:f32, dropY:f32, dropAmp:f32, dropR2:f32, pad:f32 };
+    @group(0) @binding(0) var<storage, read>       hPrev: array<f32>;
+    @group(0) @binding(1) var<storage, read_write> hNext: array<f32>;
+    @group(0) @binding(2) var<storage, read_write> vel:   array<f32>;
+    @group(0) @binding(3) var<uniform>             u: U;
+    @compute @workgroup_size(64)
+    fn cs(@builtin(global_invocation_id) gid: vec3<u32>){
+      let i = gid.x;
+      if (i >= u.n*u.n) { return; }
+      let gx = i % u.n;
+      let gy = i / u.n;
+      let c = hPrev[i];
+      let xm = select(gx - 1u, gx, gx == 0u);
+      let xp = select(gx + 1u, gx, gx == u.n - 1u);
+      let ym = select(gy - 1u, gy, gy == 0u);
+      let yp = select(gy + 1u, gy, gy == u.n - 1u);
+      let lap = hPrev[gy*u.n + xm] + hPrev[gy*u.n + xp]
+              + hPrev[ym*u.n + gx] + hPrev[yp*u.n + gx] - 4.0*c;
+      let v = (vel[i] + lap*u.c) * u.damp;
+      var h = c + v;
+      if (u.dropAmp > 0.0){
+        let dx = f32(gx) - u.dropX; let dy = f32(gy) - u.dropY;
+        let d2 = dx*dx + dy*dy;
+        if (d2 < u.dropR2){ h = h + u.dropAmp*(1.0 - d2/u.dropR2); }
+      }
+      vel[i] = v;
+      hNext[i] = h;
+    }`});
+  const renderMod=device.createShaderModule({code:`
+    struct U { n:u32, c:f32, damp:f32, dropX:f32, dropY:f32, dropAmp:f32, dropR2:f32, pad:f32 };
+    @group(0) @binding(0) var<uniform> u: U;
+    struct VSOut { @builtin(position) pos: vec4<f32>, @location(0) color: vec3<f32> };
+    @vertex fn vs(@builtin(vertex_index) vi: u32, @location(0) h: f32) -> VSOut {
+      let gx = vi % u.n;
+      let gy = vi / u.n;
+      let x = f32(gx)/f32(u.n - 1u)*2.0 - 1.0;
+      let y = f32(gy)/f32(u.n - 1u)*2.0 - 1.0;
+      var o: VSOut; o.pos = vec4<f32>(x, y, 0.0, 1.0);
+      let cc = clamp(h*2.5 + 0.5, 0.0, 1.0);
+      o.color = mix(vec3<f32>(0.0,0.12,0.35), vec3<f32>(0.65,0.88,1.0), cc);
+      return o;
+    }
+    @fragment fn fs(in: VSOut) -> @location(0) vec4<f32> { return vec4<f32>(in.color,1.0); }`});
+
+  const computePipe=device.createComputePipeline({layout:"auto", compute:{module:computeMod,entryPoint:"cs"}});
+  const renderPipe=device.createRenderPipeline({layout:"auto",
+    vertex:{module:renderMod,entryPoint:"vs",buffers:[
+      {arrayStride:4, attributes:[{shaderLocation:0,offset:0,format:"float32"}]}]},
+    fragment:{module:renderMod,entryPoint:"fs",targets:[{format}]},
+    primitive:{topology:"point-list"}});
+
+  // ping-pong compute bind groups: AB reads hA writes hB, BA reads hB writes hA
+  const bgAB=device.createBindGroup({layout:computePipe.getBindGroupLayout(0),entries:[
+    {binding:0,resource:{buffer:hA}},{binding:1,resource:{buffer:hB}},
+    {binding:2,resource:{buffer:vel}},{binding:3,resource:{buffer:uBuf}}]});
+  const bgBA=device.createBindGroup({layout:computePipe.getBindGroupLayout(0),entries:[
+    {binding:0,resource:{buffer:hB}},{binding:1,resource:{buffer:hA}},
+    {binding:2,resource:{buffer:vel}},{binding:3,resource:{buffer:uBuf}}]});
+  const rbgA=device.createBindGroup({layout:renderPipe.getBindGroupLayout(0),entries:[{binding:0,resource:{buffer:uBuf}}]});
+
+  const groups=Math.ceil(CELLS/64);
+  let readIsA=true;   // hA is current "previous"
+  let frame=0;
+
+  return {
+    name:"WebGPU (GPU compute wave)", info,
+    resize(){},
+    frame(){
+      const enc=device.createCommandEncoder();
+      for(let k=0;k<WORK;k++){
+        const drop = (k===0) ? dropForFrame(frame) : {amp:0,x:0,y:0};
+        uF[3]=drop.x; uF[4]=drop.y; uF[5]=drop.amp;
+        device.queue.writeBuffer(uBuf,0,uAB);
+        const cp=enc.beginComputePass();
+        cp.setPipeline(computePipe);
+        cp.setBindGroup(0, readIsA?bgAB:bgBA);   // read current, write other
+        cp.dispatchWorkgroups(groups);
+        cp.end();
+        readIsA=!readIsA;                         // swap: written buffer becomes current
+      }
+      frame++;
+      // current "previous" buffer (latest heights) is hA if readIsA else hB
+      const curr = readIsA ? hA : hB;
+      const rp=enc.beginRenderPass({colorAttachments:[{
+        view:ctx.getCurrentTexture().createView(),
+        clearValue:{r:0.01,g:0.012,b:0.03,a:1}, loadOp:"clear", storeOp:"store"}]});
+      rp.setPipeline(renderPipe);
+      rp.setBindGroup(0,rbgA);
+      rp.setVertexBuffer(0,curr);
+      rp.draw(CELLS);
+      rp.end();
+      device.queue.submit([enc.finish()]);
+    }
+  };
+}
+
+// ---------------------------------------------------------------- stats (same harness as the other PERF pages)
+let samples=[],frameNo=0,collecting=false,collectStart=0,done=false,rolling=[];
+function resetStats(){samples=[];frameNo=0;collecting=false;done=false;rolling=[];summary.textContent="";}
+function finalize(){
+  done=true;collecting=false;
+  if(!samples.length){summary.textContent="no samples";return;}
+  const s=[...samples].sort((a,b)=>a-b);
+  const mean=s.reduce((a,b)=>a+b,0)/s.length;
+  const p=q=>s[Math.min(s.length-1,Math.floor(s.length*q))];
+  const r={frames:s.length,meanFps:+(1000/mean).toFixed(1),
+    p50ms:+p(.5).toFixed(2),p95ms:+p(.95).toFixed(2),p99ms:+p(.99).toFixed(2),
+    minms:+s[0].toFixed(2),maxms:+s[s.length-1].toFixed(2),
+    slow_gt33ms:s.filter(x=>x>33.3).length};
+  summary.textContent=
+    `=== RESULT (${backend.name}) ===\n`+
+    `grid      : ${N}×${N} (${CELLS} cells) × work ${WORK}\n`+
+    `frames    : ${r.frames}\n`+
+    `mean FPS  : ${r.meanFps}\n`+
+    `p50/p95/p99 ms : ${r.p50ms} / ${r.p95ms} / ${r.p99ms}\n`+
+    `min/max ms     : ${r.minms} / ${r.maxms}\n`+
+    `slow >33ms     : ${r.slow_gt33ms}`;
+  console.log("[water A/B]",{api:backend.name,grid:N,cells:CELLS,work:WORK,...r});
+  console.table([{api:backend.name,cells:CELLS,work:WORK,...r}]);
+}
+
+// ---------------------------------------------------------------- main loop
+let backend=null,prev=0;
+function resize(){
+  const dpr=Math.min(window.devicePixelRatio||1,2);
+  canvas.width=Math.floor(innerWidth*dpr);
+  canvas.height=Math.floor(innerHeight*dpr);
+  if(backend) backend.resize();
+}
+addEventListener("resize",resize);
+addEventListener("keydown",e=>{if(e.key==="r")resetStats();});
+
+function loop(now){
+  if(!prev) prev=now;
+  backend.frame();
+  const dt=now-prev; prev=now; frameNo++;
+  rolling.push(dt); if(rolling.length>30)rolling.shift();
+  const rfps=1000/(rolling.reduce((a,b)=>a+b,0)/rolling.length);
+  if(!done&&frameNo>WARMUP){
+    if(!collecting){collecting=true;collectStart=now;}
+    samples.push(dt);
+    if(SECONDS>0&&(now-collectStart)/1000>=SECONDS) finalize();
+  }
+  hud.textContent=
+    `${backend.name}\n`+
+    `grid ${N}×${N} (${CELLS.toLocaleString()} cells) × work ${WORK}\n`+
+    `FPS ${rfps.toFixed(1)}   frame ${dt.toFixed(2)} ms\n`+
+    `${backend.info}\n`+
+    (SECONDS>0
+      ? (done?`measure: DONE (press 'r' to rerun)`
+             :(collecting?`measure: ${((now-collectStart)/1000).toFixed(1)}/${SECONDS}s`:`warmup…`))
+      : `measure: rolling (add ?seconds=10 for a summary)`);
+  requestAnimationFrame(loop);
+}
+
+(async function start(){
+  resize();
+  try{
+    if(API==="webgl")      backend=initWebGL();
+    else if(API==="webgpu")backend=await initWebGPU();
+    else{ try{backend=await initWebGPU();}catch(e){console.warn("WebGPU unavailable → WebGL2:",e.message);backend=initWebGL();} }
+  }catch(e){
+    hud.textContent="INIT FAILED: "+e.message;
+    summary.textContent="If you forced ?api=webgpu and WebGPU is off,\nor GLES compute is unavailable on this device,\nthis is expected — see the header.";
+    return;
+  }
+  resize();
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
