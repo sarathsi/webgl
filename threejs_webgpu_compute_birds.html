@@ -156,33 +156,40 @@
 				raycaster = new THREE.Raycaster();
 
 				// Sky
-
-				const geometry = new THREE.IcosahedronGeometry( 1, 6 );
-				const material = new THREE.MeshBasicNodeMaterial( {
-					// Use vertex positions to create atmosphere colors
-					colorNode: varying(
-						vec4(
-							sub( 0.25, positionLocal.y ),
-							sub( - 0.25, positionLocal.y ),
-							add( 1.5, positionLocal.y ),
-							1.0
-						)
-					),
-					side: THREE.BackSide
-				} );
-
-				const mesh = new THREE.Mesh( geometry, material );
-				mesh.rotation.z = 0.75;
-				mesh.scale.setScalar( 1200 );
-				scene.add( mesh );
+				// MODIFIED: full-screen sky dome DISABLED to match the WebGL match page,
+				// which renders only birds on a cleared background (no sky). At high DPR
+				// a full-screen BackSide dome is a big extra fill cost the WebGL page
+				// doesn't have. Re-enable by setting SKY=true.
+				const SKY = false;
+				if ( SKY ) {
+					const geometry = new THREE.IcosahedronGeometry( 1, 6 );
+					const material = new THREE.MeshBasicNodeMaterial( {
+						colorNode: varying(
+							vec4(
+								sub( 0.25, positionLocal.y ),
+								sub( - 0.25, positionLocal.y ),
+								add( 1.5, positionLocal.y ),
+								1.0
+							)
+						),
+						side: THREE.BackSide
+					} );
+					const mesh = new THREE.Mesh( geometry, material );
+					mesh.rotation.z = 0.75;
+					mesh.scale.setScalar( 1200 );
+					scene.add( mesh );
+				}
 
 				//
 
-				renderer = new THREE.WebGPURenderer( { antialias: true } );
+				// MODIFIED: antialias false + NoToneMapping to match the WebGL match page
+				// (WebGLRenderer() defaults: AA off, no tone mapping). MSAA at the device's
+				// ~3.25 DPR was the dominant reason WebGPU showed ~10 FPS vs ~25.
+				renderer = new THREE.WebGPURenderer( { antialias: false } );
 				renderer.setPixelRatio( window.devicePixelRatio );
 				renderer.setSize( window.innerWidth, window.innerHeight );
 				renderer.setAnimationLoop( animate );
-				renderer.toneMapping = THREE.NeutralToneMapping;
+				renderer.toneMapping = THREE.NoToneMapping;
 				container.appendChild( renderer.domElement );
 
 				const controls = new OrbitControls( camera, renderer.domElement );
@@ -232,7 +239,7 @@
 				// Define Uniforms. Uniforms only need to be defined once rather than per shader.
 			
 				effectController = {
-					separation: uniform( 15.0 ).label( 'separation' ),
+					separation: uniform( 20.0 ).label( 'separation' ),   // MODIFIED 15→20: match WebGL match (zoneRadius 60) so the O(N²) inner-loop early-exit does equal work
 					alignment: uniform( 20.0 ).label( 'alignment' ),
 					cohesion: uniform( 20.0 ).label( 'cohesion' ),
 					freedom: uniform( 0.75 ).label( 'freedom' ),
