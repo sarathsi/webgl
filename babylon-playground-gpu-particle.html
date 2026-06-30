@@ -107,6 +107,7 @@
 
     const engine    = await makeEngine();
     const isWebGPU  = !!(BABYLON.WebGPUEngine && engine instanceof BABYLON.WebGPUEngine);
+    const BACKEND   = isWebGPU ? 'WebGPU' : 'WebGL2';      // <-- active backend, shown on HUD
     const adapter   = isWebGPU ? await adapterLine()
                                : `WebGL2 (requested: ${REQ})`;
     const scene     = createScene(engine);
@@ -126,15 +127,15 @@
         p50ms:+p(.5).toFixed(2), p95ms:+p(.95).toFixed(2), p99ms:+p(.99).toFixed(2),
         minms:+s[0].toFixed(2), maxms:+s[s.length-1].toFixed(2), slow_gt33ms:s.filter(x=>x>33.3).length};
       summary.textContent =
-        `=== RESULT (${engine.constructor.name}) ===\n`+
+        `=== RESULT — ${BACKEND} (${engine.constructor.name}) ===\n`+
         `particles: cap ${CAP.toLocaleString()}  emit ${EMIT.toLocaleString()}\n`+
         `frames   : ${r.frames}\n`+
         `mean FPS : ${r.meanFps}\n`+
         `p50/p95/p99 ms : ${r.p50ms} / ${r.p95ms} / ${r.p99ms}\n`+
         `min/max ms     : ${r.minms} / ${r.maxms}\n`+
         `slow >33ms     : ${r.slow_gt33ms}`;
-      console.log('[babylon A/B]', {engine:engine.constructor.name, cap:CAP, emit:EMIT, ...r});
-      console.table([{engine:engine.constructor.name, cap:CAP, ...r}]);
+      console.log('[babylon A/B]', {backend:BACKEND, engine:engine.constructor.name, cap:CAP, emit:EMIT, ...r});
+      console.table([{backend:BACKEND, cap:CAP, ...r}]);
     }
     addEventListener('keydown', e=>{ if(e.key==='r') resetStats(); });
 
@@ -151,7 +152,8 @@
         if(SECONDS>0 && (now-collectStart)/1000 >= SECONDS) finalize();
       }
       hud.textContent =
-        `${engine.constructor.name}   ${rfps.toFixed(1)} fps   ${dt.toFixed(2)} ms\n`+
+        `ACTIVE BACKEND: ${BACKEND}   (${engine.constructor.name}, req=${REQ})\n`+
+        `${rfps.toFixed(1)} fps   ${dt.toFixed(2)} ms\n`+
         `GPU particles: cap ${CAP.toLocaleString()}  emit ${EMIT.toLocaleString()}\n`+
         `${adapter}\n`+
         (SECONDS>0
