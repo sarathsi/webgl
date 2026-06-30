@@ -40,7 +40,9 @@
 <div id="out">loading TensorFlow.js…</div>
 <script>
 "use strict";
-const Q = new URLSearchParams(location.search);
+// Tolerate URLs whose '&' got HTML-escaped to '&amp;' (markdown/chat links).
+// (Does NOT help a shell that truncated the URL at an unquoted '&' — quote the URL there.)
+const Q = new URLSearchParams(location.search.replace(/&amp;/g, "&"));
 const BACKEND = (Q.get("backend") || "webgpu").toLowerCase();
 const MODEL   = (Q.get("model")   || "matmul").toLowerCase();
 const SIZE    = Math.max(64, parseInt(Q.get("size")   || "1024", 10));
