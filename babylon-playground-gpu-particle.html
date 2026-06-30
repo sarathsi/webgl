@@ -52,9 +52,10 @@
     const Q       = new URLSearchParams(location.search.replace(/&amp;/g,'&'));
     // backend: 'auto' (default) = WebGPU if available else WebGL; or force 'webgl' / 'webgpu'.
     const REQ     = Q.has('webgpu') ? 'webgpu' : (Q.get('backend') || 'auto').toLowerCase();
-    const CAP     = Math.max(1000, parseInt(Q.get('cap')  || '1500000', 10));
-    const EMIT    = Math.max(1000, parseInt(Q.get('emit') || '300000', 10));
+    const CAP     = Math.max(1000, parseInt(Q.get('cap')  || '200000', 10));  // start safe; raise gradually
+    const EMIT    = Math.max(1000, parseInt(Q.get('emit') || '50000', 10));
     const PSIZE   = parseFloat(Q.get('size') || '0.2');
+    const PARTS   = (Q.get('particles') || 'auto').toLowerCase();  // gpu | cpu | auto (diagnose)
     const SECONDS = parseFloat(Q.get('seconds') || '0');
     const WARMUP  = Math.max(0, parseInt(Q.get('warmup') || '60', 10));
 
@@ -80,38 +81,80 @@
       return new BABYLON.Engine(canvas, false, { preserveDrawingBuffer:true, stencil:true });
     }
 
+    // Local radial-gradient dot texture (no network, no CORS — works on WebGPU from file://).
+    function makeDotTexture(scene){
+      const SZ = 64;
+      const dt = new BABYLON.DynamicTexture('dot', { width: SZ, height: SZ }, scene, false);
+      const ctx = dt.getContext();
+      const g = ctx.createRadialGradient(SZ/2, SZ/2, 0, SZ/2, SZ/2, SZ/2);
+      g.addColorStop(0.0, 'rgba(255,255,255,1)');
+      g.addColorStop(0.35, 'rgba(180,210,255,0.7)');
+      g.addColorStop(1.0, 'rgba(0,0,0,0)');
+      ctx.fillStyle = g; ctx.fillRect(0, 0, SZ, SZ);
+      dt.update();
+      dt.hasAlpha = true;
+      return dt;
+    }
+
+    let particleMode = '';
     function createScene(engine){
       const scene = new BABYLON.Scene(engine);
-      scene.clearColor = new BABYLON.Color3(0.067, 0.054, 0.157);
+      scene.clearColor = new BABYLON.Color4(0.067, 0.054, 0.157, 1.0);   // Color4 w/ alpha=1
       const camera = new BABYLON.ArcRotateCamera('cam', 0, Math.PI/2.2, 30, BABYLON.Vector3.Zero(), scene);
       camera.attachControl(canvas, true);
 
-      if (!BABYLON.GPUParticleSystem.IsSupported){
-        hud.textContent = 'GPUParticleSystem NOT supported on this engine';
-        return scene;
-      }
-      const ps = new BABYLON.GPUParticleSystem('p', { capacity: CAP }, scene);
-      ps.particleTexture = new BABYLON.Texture('https://models.babylonjs.com/Demos/particles/textures/dotParticle.png', scene);
+      // DIAGNOSTIC reference object — a big emissive wireframe box, independent of particles/texture.
+      //   * box visible but no particles  → particle-specific issue (try &particles=cpu).
+      //   * even the box is black          → WebGPU isn't rendering at all (check DevTools console;
+      //                                       serve over http instead of file://).
+      const box = BABYLON.MeshBuilder.CreateBox('ref', { size: 10 }, scene);
+      const bmat = new BABYLON.StandardMaterial('bm', scene);
+      bmat.emissiveColor = new BABYLON.Color3(0.25, 0.6, 0.4); bmat.disableLighting = true; bmat.wireframe = true;
+      box.material = bmat;
+      scene.registerBeforeRender(()=>{ box.rotation.y += 0.01; camera.alpha += 0.003; });
+
+      // Particle system: GPU (compute/transform-feedback) or CPU. ?particles=gpu|cpu|auto.
+      const useGPU = (PARTS === 'gpu') || (PARTS === 'auto' && BABYLON.GPUParticleSystem.IsSupported);
+      const ps = useGPU
+        ? new BABYLON.GPUParticleSystem('p', { capacity: CAP }, scene)
+        : new BABYLON.ParticleSystem('p', Math.min(CAP, 50000), scene);   // CPU fallback (capped)
+      particleMode = useGPU ? 'GPUParticleSystem' : 'ParticleSystem(CPU)';
+
+      // Local dot texture (no cross-origin fetch — WebGPU rejects tainted textures on file://).
+      ps.particleTexture = makeDotTexture(scene);
+      ps.blendMode = BABYLON.ParticleSystem.BLENDMODE_ONEONE;   // additive glow on dark bg
       ps.emitter = BABYLON.Vector3.Zero();
       ps.createSphereEmitter(8);
       ps.emitRate = EMIT;
-      ps.minLifeTime = 3; ps.maxLifeTime = 6;
-      ps.minSize = 0.05; ps.maxSize = PSIZE;
+      ps.minLifeTime = 2; ps.maxLifeTime = 5;
+      ps.minSize = 0.3; ps.maxSize = Math.max(PSIZE, 0.8);     // bigger so they're clearly visible
       ps.minEmitPower = 1; ps.maxEmitPower = 4;
       ps.updateSpeed = 0.01;
       ps.start();
-
-      scene.registerBeforeRender(()=>{ camera.alpha += 0.003; });   // auto-orbit = identical input
       return scene;
     }
 
-    const engine    = await makeEngine();
-    const isWebGPU  = !!(BABYLON.WebGPUEngine && engine instanceof BABYLON.WebGPUEngine);
-    const BACKEND   = isWebGPU ? 'WebGPU' : 'WebGL2';      // <-- active backend, shown on HUD
-    const adapter   = isWebGPU ? await adapterLine()
-                               : `WebGL2 (requested: ${REQ})`;
-    const scene     = createScene(engine);
-    engine.runRenderLoop(()=>scene.render());
+    let engine, isWebGPU, BACKEND, adapter, scene;
+    try {
+      engine   = await makeEngine();
+      isWebGPU = !!(BABYLON.WebGPUEngine && engine instanceof BABYLON.WebGPUEngine);
+      BACKEND  = isWebGPU ? 'WebGPU' : 'WebGL2';      // active backend, shown on HUD
+      adapter  = isWebGPU ? await adapterLine() : `WebGL2 (requested: ${REQ})`;
+      scene    = createScene(engine);
+    } catch (e) {
+      hud.textContent = 'INIT ERROR (' + REQ + '): ' + ((e && e.message) || e) +
+        '\nTry serving over http (not file://) and check the DevTools console.';
+      console.error(e);
+      throw e;
+    }
+    let renderErr = '';
+    // Surface a lost device/context (e.g. too many particles → GPU OOM / watchdog → black).
+    if (engine.onContextLostObservable)
+      engine.onContextLostObservable.add(()=>{ renderErr = 'CONTEXT/DEVICE LOST — lower ?cap (GPU OOM/watchdog?)'; console.error('context lost'); });
+    engine.runRenderLoop(()=>{
+      try { scene.render(); }
+      catch(e){ if(!renderErr){ renderErr = String((e && e.message) || e); console.error(e); } }
+    });
     addEventListener('resize', ()=>engine.resize());
 
     // ---- timed FPS measurement (same logic as the other PERF benchmarks) ----
@@ -154,8 +197,9 @@
       hud.textContent =
         `ACTIVE BACKEND: ${BACKEND}   (${engine.constructor.name}, req=${REQ})\n`+
         `${rfps.toFixed(1)} fps   ${dt.toFixed(2)} ms\n`+
-        `GPU particles: cap ${CAP.toLocaleString()}  emit ${EMIT.toLocaleString()}\n`+
+        `particles: ${particleMode}  cap ${CAP.toLocaleString()}  emit ${EMIT.toLocaleString()}\n`+
         `${adapter}\n`+
+        (renderErr ? `RENDER ERROR: ${renderErr}\n` : ``)+
         (SECONDS>0
           ? (done ? `measure: DONE (press 'r' to rerun)`
                   : (collecting ? `measure: ${((now-collectStart)/1000).toFixed(1)}/${SECONDS}s` : `warmup…`))
