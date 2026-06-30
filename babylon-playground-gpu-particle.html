@@ -7,13 +7,20 @@
     * WebGL2 : transform feedback
   So this is a GPU-bound particle test (the CPU ParticleSystem in index.html is not).
 
-  Backend toggle (matches the Babylon playground convention):
-    ?backend=webgl | webgpu     (default webgl)
-    ?webgpu                      (shorthand for backend=webgpu)
+  Backend selection:
+    ?backend=auto | webgl | webgpu   (default auto = WebGPU if available, else WebGL2)
+    ?webgpu                          (shorthand for backend=webgpu)
+    The overlay prints the ACTUAL engine ("WebGPUEngine" vs "Engine"/"ThinEngine"),
+    so in auto mode you can see which backend was chosen.
   Heaviness knobs:
     ?cap=N      particle capacity (default 1500000)
     ?emit=N     emit rate (default 300000)
     ?size=F     particle max size (default 0.2)
+  Timed measurement (like the other PERF benchmarks):
+    ?seconds=S  measure S s after warmup, then print mean/p50/p95/p99 ms + slow frames
+                (default 0 = run forever, rolling FPS only)
+    ?warmup=F   frames skipped before measuring (default 60)
+  Press 'r' to restart the measurement window.
 
   A/B: open the same file with ?backend=webgl then ?backend=webgpu and compare the
   FPS in the top-left overlay (which also prints the engine name so you can confirm
@@ -29,21 +36,27 @@
     html,body,#renderCanvas{width:100%;height:100%;margin:0;padding:0;overflow:hidden;background:#000}
     #hud{position:fixed;top:8px;left:8px;z-index:999;font:13px/1.5 monospace;color:#9fe;
          background:rgba(0,0,0,.6);padding:7px 10px;border-radius:6px;white-space:pre;pointer-events:none}
+    #summary{position:fixed;top:8px;right:8px;z-index:999;font:13px/1.5 monospace;color:#aef0c0;
+         background:rgba(0,0,0,.6);padding:7px 10px;border-radius:6px;white-space:pre;max-width:46vw;pointer-events:none}
   </style>
 </head>
 <body>
   <canvas id="renderCanvas"></canvas>
   <div id="hud">starting…</div>
+  <div id="summary"></div>
   <script type="module">
     const BABYLON = window.BABYLON;
     const canvas  = document.getElementById('renderCanvas');
     const hud     = document.getElementById('hud');
 
     const Q       = new URLSearchParams(location.search.replace(/&amp;/g,'&'));
-    const wantGPU = Q.has('webgpu') || (Q.get('backend')||'webgl').toLowerCase() === 'webgpu';
+    // backend: 'auto' (default) = WebGPU if available else WebGL; or force 'webgl' / 'webgpu'.
+    const REQ     = Q.has('webgpu') ? 'webgpu' : (Q.get('backend') || 'auto').toLowerCase();
     const CAP     = Math.max(1000, parseInt(Q.get('cap')  || '1500000', 10));
     const EMIT    = Math.max(1000, parseInt(Q.get('emit') || '300000', 10));
     const PSIZE   = parseFloat(Q.get('size') || '0.2');
+    const SECONDS = parseFloat(Q.get('seconds') || '0');
+    const WARMUP  = Math.max(0, parseInt(Q.get('warmup') || '60', 10));
 
     // best-effort WebGPU adapter readout (Vulkan vs GLES hint)
     async function adapterLine(){
@@ -53,12 +66,17 @@
       catch(e){ return 'adapter query failed: '+e.message; }
     }
 
+    // Pick engine: 'auto' uses WebGPU when supported, else WebGL; 'webgpu'/'webgl' force it.
     async function makeEngine(){
-      if (wantGPU && BABYLON.WebGPUEngine && await BABYLON.WebGPUEngine.IsSupportedAsync){
+      const wgpuSupported = !!BABYLON.WebGPUEngine && await BABYLON.WebGPUEngine.IsSupportedAsync;
+      const useGPU = (REQ === 'webgpu') || (REQ === 'auto' && wgpuSupported);
+      if (useGPU && wgpuSupported){
         const e = new BABYLON.WebGPUEngine(canvas, { antialias:false, stencil:true });
         await e.initAsync();                       // loads glslang/twgsl from CDN
         return e;
       }
+      if (REQ === 'webgpu' && !wgpuSupported)
+        console.warn('WebGPU requested but unsupported → falling back to WebGL2');
       return new BABYLON.Engine(canvas, false, { preserveDrawingBuffer:true, stencil:true });
     }
 
@@ -87,17 +105,59 @@
       return scene;
     }
 
-    const engine  = await makeEngine();
-    const adapter = wantGPU ? await adapterLine() : 'WebGL2';
-    const scene   = createScene(engine);
+    const engine    = await makeEngine();
+    const isWebGPU  = !!(BABYLON.WebGPUEngine && engine instanceof BABYLON.WebGPUEngine);
+    const adapter   = isWebGPU ? await adapterLine()
+                               : `WebGL2 (requested: ${REQ})`;
+    const scene     = createScene(engine);
     engine.runRenderLoop(()=>scene.render());
     addEventListener('resize', ()=>engine.resize());
 
+    // ---- timed FPS measurement (same logic as the other PERF benchmarks) ----
+    const summary = document.getElementById('summary');
+    let samples=[], frameNo=0, collecting=false, collectStart=0, done=false, rolling=[], prev=0;
+    function resetStats(){ samples=[]; frameNo=0; collecting=false; done=false; rolling=[]; prev=0; summary.textContent=''; }
+    function finalize(){
+      done=true; collecting=false;
+      if(!samples.length){ summary.textContent='no samples'; return; }
+      const s=[...samples].sort((a,b)=>a-b), mean=s.reduce((a,b)=>a+b,0)/s.length;
+      const p=q=>s[Math.min(s.length-1, Math.floor(s.length*q))];
+      const r={frames:s.length, meanFps:+(1000/mean).toFixed(1),
+        p50ms:+p(.5).toFixed(2), p95ms:+p(.95).toFixed(2), p99ms:+p(.99).toFixed(2),
+        minms:+s[0].toFixed(2), maxms:+s[s.length-1].toFixed(2), slow_gt33ms:s.filter(x=>x>33.3).length};
+      summary.textContent =
+        `=== RESULT (${engine.constructor.name}) ===\n`+
+        `particles: cap ${CAP.toLocaleString()}  emit ${EMIT.toLocaleString()}\n`+
+        `frames   : ${r.frames}\n`+
+        `mean FPS : ${r.meanFps}\n`+
+        `p50/p95/p99 ms : ${r.p50ms} / ${r.p95ms} / ${r.p99ms}\n`+
+        `min/max ms     : ${r.minms} / ${r.maxms}\n`+
+        `slow >33ms     : ${r.slow_gt33ms}`;
+      console.log('[babylon A/B]', {engine:engine.constructor.name, cap:CAP, emit:EMIT, ...r});
+      console.table([{engine:engine.constructor.name, cap:CAP, ...r}]);
+    }
+    addEventListener('keydown', e=>{ if(e.key==='r') resetStats(); });
+
     scene.onAfterRenderObservable.add(()=>{
+      const now = performance.now();
+      if(!prev) prev = now;
+      const dt = now - prev; prev = now;
+      frameNo++;
+      rolling.push(dt); if(rolling.length>30) rolling.shift();
+      const rfps = 1000/(rolling.reduce((a,b)=>a+b,0)/rolling.length);
+      if(!done && frameNo>WARMUP){
+        if(!collecting){ collecting=true; collectStart=now; }
+        samples.push(dt);
+        if(SECONDS>0 && (now-collectStart)/1000 >= SECONDS) finalize();
+      }
       hud.textContent =
-        `${engine.constructor.name}   ${engine.getFps().toFixed(1)} fps\n`+
+        `${engine.constructor.name}   ${rfps.toFixed(1)} fps   ${dt.toFixed(2)} ms\n`+
         `GPU particles: cap ${CAP.toLocaleString()}  emit ${EMIT.toLocaleString()}\n`+
-        `${adapter}`;
+        `${adapter}\n`+
+        (SECONDS>0
+          ? (done ? `measure: DONE (press 'r' to rerun)`
+                  : (collecting ? `measure: ${((now-collectStart)/1000).toFixed(1)}/${SECONDS}s` : `warmup…`))
+          : `measure: rolling (add ?seconds=10 for a summary)`);
     });
   </script>
 </body>
