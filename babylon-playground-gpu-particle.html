@@ -1,0 +1,104 @@
+<!doctype html>
+<!--
+  Babylon.js GPUParticleSystem benchmark — WebGL2 vs WebGPU, same scene.
+
+  GPUParticleSystem runs the particle update on the GPU:
+    * WebGPU : compute shader
+    * WebGL2 : transform feedback
+  So this is a GPU-bound particle test (the CPU ParticleSystem in index.html is not).
+
+  Backend toggle (matches the Babylon playground convention):
+    ?backend=webgl | webgpu     (default webgl)
+    ?webgpu                      (shorthand for backend=webgpu)
+  Heaviness knobs:
+    ?cap=N      particle capacity (default 1500000)
+    ?emit=N     emit rate (default 300000)
+    ?size=F     particle max size (default 0.2)
+
+  A/B: open the same file with ?backend=webgl then ?backend=webgpu and compare the
+  FPS in the top-left overlay (which also prints the engine name so you can confirm
+  WebGL2 = "Engine"/"ThinEngine" vs WebGPU = "WebGPUEngine", and the adapter).
+-->
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>Babylon GPUParticleSystem — WebGL vs WebGPU</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <script src="https://cdn.babylonjs.com/babylon.js"></script>
+  <style>
+    html,body,#renderCanvas{width:100%;height:100%;margin:0;padding:0;overflow:hidden;background:#000}
+    #hud{position:fixed;top:8px;left:8px;z-index:999;font:13px/1.5 monospace;color:#9fe;
+         background:rgba(0,0,0,.6);padding:7px 10px;border-radius:6px;white-space:pre;pointer-events:none}
+  </style>
+</head>
+<body>
+  <canvas id="renderCanvas"></canvas>
+  <div id="hud">starting…</div>
+  <script type="module">
+    const BABYLON = window.BABYLON;
+    const canvas  = document.getElementById('renderCanvas');
+    const hud     = document.getElementById('hud');
+
+    const Q       = new URLSearchParams(location.search.replace(/&amp;/g,'&'));
+    const wantGPU = Q.has('webgpu') || (Q.get('backend')||'webgl').toLowerCase() === 'webgpu';
+    const CAP     = Math.max(1000, parseInt(Q.get('cap')  || '1500000', 10));
+    const EMIT    = Math.max(1000, parseInt(Q.get('emit') || '300000', 10));
+    const PSIZE   = parseFloat(Q.get('size') || '0.2');
+
+    // best-effort WebGPU adapter readout (Vulkan vs GLES hint)
+    async function adapterLine(){
+      if (!navigator.gpu) return 'navigator.gpu: undefined';
+      try { const a = await navigator.gpu.requestAdapter(); if(!a) return 'WebGPU adapter: null';
+        const i = a.info || {}; return 'adapter: ' + [i.vendor,i.architecture,i.device,i.description].filter(Boolean).join(' / '); }
+      catch(e){ return 'adapter query failed: '+e.message; }
+    }
+
+    async function makeEngine(){
+      if (wantGPU && BABYLON.WebGPUEngine && await BABYLON.WebGPUEngine.IsSupportedAsync){
+        const e = new BABYLON.WebGPUEngine(canvas, { antialias:false, stencil:true });
+        await e.initAsync();                       // loads glslang/twgsl from CDN
+        return e;
+      }
+      return new BABYLON.Engine(canvas, false, { preserveDrawingBuffer:true, stencil:true });
+    }
+
+    function createScene(engine){
+      const scene = new BABYLON.Scene(engine);
+      scene.clearColor = new BABYLON.Color3(0.067, 0.054, 0.157);
+      const camera = new BABYLON.ArcRotateCamera('cam', 0, Math.PI/2.2, 30, BABYLON.Vector3.Zero(), scene);
+      camera.attachControl(canvas, true);
+
+      if (!BABYLON.GPUParticleSystem.IsSupported){
+        hud.textContent = 'GPUParticleSystem NOT supported on this engine';
+        return scene;
+      }
+      const ps = new BABYLON.GPUParticleSystem('p', { capacity: CAP }, scene);
+      ps.particleTexture = new BABYLON.Texture('https://models.babylonjs.com/Demos/particles/textures/dotParticle.png', scene);
+      ps.emitter = BABYLON.Vector3.Zero();
+      ps.createSphereEmitter(8);
+      ps.emitRate = EMIT;
+      ps.minLifeTime = 3; ps.maxLifeTime = 6;
+      ps.minSize = 0.05; ps.maxSize = PSIZE;
+      ps.minEmitPower = 1; ps.maxEmitPower = 4;
+      ps.updateSpeed = 0.01;
+      ps.start();
+
+      scene.registerBeforeRender(()=>{ camera.alpha += 0.003; });   // auto-orbit = identical input
+      return scene;
+    }
+
+    const engine  = await makeEngine();
+    const adapter = wantGPU ? await adapterLine() : 'WebGL2';
+    const scene   = createScene(engine);
+    engine.runRenderLoop(()=>scene.render());
+    addEventListener('resize', ()=>engine.resize());
+
+    scene.onAfterRenderObservable.add(()=>{
+      hud.textContent =
+        `${engine.constructor.name}   ${engine.getFps().toFixed(1)} fps\n`+
+        `GPU particles: cap ${CAP.toLocaleString()}  emit ${EMIT.toLocaleString()}\n`+
+        `${adapter}`;
+    });
+  </script>
+</body>
+</html>
