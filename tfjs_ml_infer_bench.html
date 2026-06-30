@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<!--
+  TensorFlow.js ML inference benchmark — WebGL vs WebGPU (vs WASM/CPU).
+  TF.js is the framework that has BOTH a webgl and a webgpu backend, so it's the
+  way to get an apples-to-apples WebGL2-vs-WebGPU ML number (Transformers.js can't
+  do WebGL).
+
+  Loads TF.js from a pinned CDN (needs internet; serve via http.server + hdc rport).
+
+  URL params:
+    ?backend=webgpu | webgl | wasm | cpu   (default webgpu; falls back to webgl then cpu)
+    ?model=matmul | mobilenet              (default matmul)
+        matmul    = repeated large matrix multiply (pure backend compute, NO model
+                    download — the core of NN inference; reports ms/run + GFLOP/s).
+        mobilenet = real image-classification model (MobileNet v2); downloads weights.
+    ?size=N      (matmul matrix size NxN, default 1024)
+    ?runs=R      (timed inference runs, default 50)
+    ?warmup=W    (untimed warmup runs — shader compile + weight upload, default 10)
+  Press 'r' to rerun.
+
+  A/B recipe: open with ?backend=webgl then ?backend=webgpu (same model/size) and
+  compare ms/run. On Vulkan this should show WebGPU clearly faster for matmul/conv.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>TF.js ML inference — WebGL vs WebGPU</title>
+<style>
+  html,body{margin:0;height:100%;background:#05060a;color:#e8e8ec;font:13px/1.5 monospace;}
+  #out{padding:14px 16px;white-space:pre-wrap;}
+  b{color:#9fe;}
+</style>
+<!-- pinned CDN: TF.js core (incl. webgl + cpu backends), the webgpu backend, and MobileNet -->
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-webgpu@4.22.0/dist/tf-backend-webgpu.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/mobilenet@2.1.1/dist/mobilenet.min.js"></script>
+</head>
+<body>
+<div id="out">loading TensorFlow.js…</div>
+<script>
+"use strict";
+const Q = new URLSearchParams(location.search);
+const BACKEND = (Q.get("backend") || "webgpu").toLowerCase();
+const MODEL   = (Q.get("model")   || "matmul").toLowerCase();
+const SIZE    = Math.max(64, parseInt(Q.get("size")   || "1024", 10));
+const RUNS    = Math.max(1,  parseInt(Q.get("runs")   || "50", 10));
+const WARMUP  = Math.max(0,  parseInt(Q.get("warmup") || "10", 10));
+const out = document.getElementById("out");
+const log = (s) => { out.innerHTML = s; };
+
+async function pickBackend(){
+  // try requested backend, then sensible fallbacks
+  const order = [BACKEND, "webgpu", "webgl", "wasm", "cpu"].filter((v,i,a)=>a.indexOf(v)===i);
+  for (const b of order){
+    try { if (await tf.setBackend(b)) { await tf.ready(); if (tf.getBackend()===b) return b; } }
+    catch(e){ /* try next */ }
+  }
+  await tf.ready(); return tf.getBackend();
+}
+
+function adapterInfoLine(){
+  // best-effort WebGPU adapter readout (Vulkan vs GLES hint)
+  if (!navigator.gpu) return Promise.resolve("navigator.gpu: undefined");
+  return navigator.gpu.requestAdapter().then(a=>{
+    if (!a) return "WebGPU adapter: null";
+    const i = a.info || {};
+    return "WebGPU adapter: " + [i.vendor,i.architecture,i.device,i.description].filter(Boolean).join(" / ");
+  }).catch(e=>"adapter query failed: "+e.message);
+}
+
+function stats(ms){
+  const s=[...ms].sort((a,b)=>a-b), mean=s.reduce((a,b)=>a+b,0)/s.length;
+  const p=q=>s[Math.min(s.length-1,Math.floor(s.length*q))];
+  return {mean, p50:p(.5), p95:p(.95), min:s[0], max:s[s.length-1]};
+}
+
+async function runMatmul(){
+  const A = tf.randomNormal([SIZE,SIZE]);
+  const B = tf.randomNormal([SIZE,SIZE]);
+  const once = async ()=>{ const C=tf.matMul(A,B); await C.data(); C.dispose(); };
+  for (let i=0;i<WARMUP;i++) await once();
+  const ms=[];
+  for (let i=0;i<RUNS;i++){ const t=performance.now(); const C=tf.matMul(A,B); await C.data(); C.dispose(); ms.push(performance.now()-t); }
+  A.dispose(); B.dispose();
+  const st=stats(ms);
+  const gflop = (2*SIZE*SIZE*SIZE/1e9) / (st.mean/1000);
+  return {label:`matmul ${SIZE}×${SIZE}`, st, extra:`GFLOP/s (mean): ${gflop.toFixed(1)}`};
+}
+
+async function runMobilenet(){
+  if (typeof mobilenet === "undefined") throw new Error("mobilenet lib not loaded");
+  const model = await mobilenet.load({version:2, alpha:1.0});
+  const x = tf.zeros([224,224,3]);   // dummy image tensor
+  const once = async ()=>{ const y=model.infer(x); await y.data(); y.dispose(); };
+  for (let i=0;i<WARMUP;i++) await once();
+  const ms=[];
+  for (let i=0;i<RUNS;i++){ const t=performance.now(); const y=model.infer(x); await y.data(); y.dispose(); ms.push(performance.now()-t); }
+  x.dispose();
+  const st=stats(ms);
+  return {label:"MobileNet v2 (224×224)", st, extra:`throughput: ${(1000/st.mean).toFixed(1)} img/s`};
+}
+
+async function main(){
+  if (typeof tf === "undefined"){ log("TensorFlow.js failed to load (no internet? CDN blocked?)"); return; }
+  log("selecting backend…");
+  const active = await pickBackend();
+  const adapter = await adapterInfoLine();
+  log(`backend requested: <b>${BACKEND}</b>   active: <b>${active}</b>\nrunning ${MODEL}…  (warmup ${WARMUP}, runs ${RUNS})\n${adapter}`);
+  let r;
+  try { r = (MODEL==="mobilenet") ? await runMobilenet() : await runMatmul(); }
+  catch(e){ log("RUN FAILED: "+e.message+"\nbackend="+active); return; }
+  const {st,label,extra} = r;
+  log(
+    `<b>=== TF.js result ===</b>\n`+
+    `model    : ${label}\n`+
+    `backend  : requested <b>${BACKEND}</b>, active <b>${active}</b>\n`+
+    `runs     : ${RUNS} (warmup ${WARMUP})\n`+
+    `ms/run   : mean <b>${st.mean.toFixed(2)}</b>   p50 ${st.p50.toFixed(2)}   p95 ${st.p95.toFixed(2)}   min ${st.min.toFixed(2)}   max ${st.max.toFixed(2)}\n`+
+    `${extra}\n`+
+    `${adapter}\n\n`+
+    `A/B: reload with ?backend=webgl vs ?backend=webgpu (same ?model/?size). Press 'r' to rerun.\n`+
+    `tf.env flags: webgpu=${!!(navigator.gpu)}  device=${tf.getBackend()}`
+  );
+  console.log("[tfjs A/B]", {model:label, requested:BACKEND, active, runs:RUNS, ...st, extra});
+}
+addEventListener("keydown", e=>{ if(e.key==="r") location.reload(); });
+main();
+</script>
+</body>
+</html>

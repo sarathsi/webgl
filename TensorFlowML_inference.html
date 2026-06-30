@@ -1,0 +1,17 @@
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-webgpu@4.22.0/dist/tf-backend-webgpu.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/mobilenet@2.1.1/dist/mobilenet.min.js"></script>
+<script>
+(async () => {
+  await tf.setBackend('webgpu');        // or 'webgl'
+  await tf.ready();
+  console.log('backend:', tf.getBackend());
+  const model = await mobilenet.load({ version: 2, alpha: 1.0 });
+  const x = tf.zeros([224, 224, 3]);
+  for (let i = 0; i < 5; i++) { const y = model.infer(x); await y.data(); y.dispose(); } // warmup
+  const t = performance.now();
+  const N = 50;
+  for (let i = 0; i < N; i++) { const y = model.infer(x); await y.data(); y.dispose(); }
+  console.log('ms/inference:', ((performance.now() - t) / N).toFixed(2));
+})();
+</script>
