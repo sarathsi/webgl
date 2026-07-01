@@ -216,8 +216,13 @@ async function initWebGPU(){
   const adapter=await navigator.gpu.requestAdapter({powerPreference:"high-performance"});
   if(!adapter) throw new Error("requestAdapter() returned null");
   const device=await adapter.requestDevice();
+  // Surface device loss / GPU errors on the HUD (not just console). A lost device
+  // (e.g. the compute dispatch exceeding the OHOS GPU watchdog at high ?count) is the
+  // usual cause of "WebGL works, WebGPU black".
+  device.lost.then((info)=>{ fatalErr = "WebGPU DEVICE LOST: "+info.reason+" "+(info.message||"")+
+    "  → lower ?count (e.g. ?count=4096)"; console.error("device lost", info); });
   if(device.addEventListener) device.addEventListener("uncapturederror",
-    e=>console.error("WebGPU error:", (e.error&&e.error.message)||e));
+    e=>{ const m=(e.error&&e.error.message)||String(e); if(!fatalErr) fatalErr="WebGPU error: "+m; console.error("WebGPU error:", m); });
   const ctx=canvas.getContext("webgpu");
   const format=navigator.gpu.getPreferredCanvasFormat();
   ctx.configure({device,format,alphaMode:"opaque"});
@@ -247,7 +252,7 @@ async function initWebGPU(){
     fn velStep(@builtin(global_invocation_id) gid: vec3<u32>,
                @builtin(local_invocation_index) lidx: u32){
       let i = gid.x;
-      let self = pos[min(i, u.n - 1u)];
+      let selfPos = pos[min(i, u.n - 1u)];   // NOTE: 'self' is a RESERVED keyword in WGSL
       var acc = vec2<f32>(0.0, 0.0);
       let tiles = (u.n + ${TILE}u - 1u) / ${TILE}u;
       for (var t: u32 = 0u; t < tiles; t = t + 1u){
@@ -257,7 +262,7 @@ async function initWebGPU(){
         shPos[lidx] = pj;
         workgroupBarrier();
         for (var k: u32 = 0u; k < ${TILE}u; k = k + 1u){
-          let d = shPos[k] - self;
+          let d = shPos[k] - selfPos;
           let r2 = dot(d, d) + u.soft;
           let inv = inverseSqrt(r2);
           acc = acc + d * (u.g * inv*inv*inv);
@@ -350,7 +355,7 @@ function finalize(){
 }
 
 // ---------------------------------------------------------------- main loop
-let backend=null,prev=0;
+let backend=null,prev=0,fatalErr="";
 function resize(){
   const dpr=Math.min(window.devicePixelRatio||1,2);
   canvas.width=Math.floor(innerWidth*dpr);
@@ -362,7 +367,10 @@ addEventListener("keydown",e=>{if(e.key==="r")resetStats();});
 
 function loop(now){
   if(!prev) prev=now;
-  backend.frame();
+  if(fatalErr){ hud.textContent = `${backend.name}\n${fatalErr}`; return; }   // stop; show cause
+  try { backend.frame(); }
+  catch(e){ fatalErr = "frame() threw: "+((e&&e.message)||e); console.error(e);
+            hud.textContent = `${backend.name}\n${fatalErr}`; return; }
   const dt=now-prev; prev=now; frameNo++;
   rolling.push(dt); if(rolling.length>30)rolling.shift();
   const rfps=1000/(rolling.reduce((a,b)=>a+b,0)/rolling.length);
