@@ -1,14 +1,13 @@
 <!DOCTYPE html>
 <!--
   WebGPU vs WebGL2 — TILED N-BODY (O(N²) gravity) A/B.  FAIR GPU-vs-GPU.
-  Self-contained, no network deps. Works offline on the OHOS device.
+  Self-contained, no network deps.
 
   Same simulation on both: N point masses, 2D gravity, every body pulled by every
   other (O(N²)), softened, speed-clamped, toroidal wrap. Rendered identically as
   1px points coloured by speed.
 
-  The difference is HOW the O(N²) gather is done — and this is the case where
-  WebGPU's compute model structurally beats WebGL:
+  The difference is HOW the O(N²) gather is done:
     * WebGPU : a COMPUTE shader with WORKGROUP SHARED MEMORY tiling. Each workgroup
                loads a tile of positions into fast on-chip shared memory once, all
                64 threads reuse it, then advances to the next tile. This slashes
@@ -17,15 +16,14 @@
                a fragment pass where each body loops over ALL others via texelFetch
                on a position texture (texture cache, but no shared-memory reuse).
 
-  Both are O(N²) on the GPU; WebGPU wins because shared-memory tiling beats repeated
-  texture/global reads. (Contrast: the stock three.js boids does a NAIVE storage
-  loop with no tiling, which is why it LOSES to WebGL there.)
+  Both are O(N²) on the GPU. Shared-memory tiling beats repeated texture/global reads.
+  (Contrast: the stock three.js boids does a NAIVE storage loop with no tiling)
 
-  IMPORTANT (OHOS):
+  IMPORTANT:
     * Vulkan ON  (Dawn→Vulkan): genuine native win, shared memory is real on-chip.
     * Vulkan OFF (compat, Dawn→GLES→ANGLE): needs GLES 3.1 compute; if unavailable
       WebGPU init fails and the HUD says so.
-    * WebGL2 needs EXT_color_buffer_float (float render targets) — checked, errors if absent.
+    * WebGL2 needs EXT_color_buffer_float (float render targets).
 
   URL params:
     ?api=webgpu | webgl | auto   (default auto = WebGPU if available else WebGL2)
